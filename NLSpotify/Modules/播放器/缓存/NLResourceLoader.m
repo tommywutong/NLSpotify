@@ -2,373 +2,536 @@
 //  NLResourceLoader.m
 //  NLSpotify
 //
-//  Created by 吴桐 on 2026/2/26.
-//
 
 #import "NLResourceLoader.h"
 #import "NLCacheManager.h"
-#import "RACSubject.h"
+#import "NLHTTPRangeValidator.h"
+#import "NLAudioMemoryCache.h"
+#import <fcntl.h>
+#import <unistd.h>
 
-@interface NLResourceLoader ()<NSURLSessionDataDelegate>
+@interface NLResourceLoader () <NSURLSessionDataDelegate>
 @property (nonatomic, strong) NSURLSession *session;
+@property (nonatomic, strong) NLCacheManager *cacheManager;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSMutableDictionary<NSString *, id> *> *pendingRequestContextMap;
+@property (nonatomic, strong) dispatch_queue_t processingQueue;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, AVAssetResourceLoadingRequest *> *taskRequestMap;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSURLSessionDataTask *> *tasksMap;
-@property (nonatomic, strong) NSLock *mapLock;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSMutableDictionary<NSString *, id> *> *taskContextMap;
+@property (nonatomic, strong) NSLock *mapLock;
+- (long long)serveLocalDataForRequest:(AVAssetResourceLoadingRequest *)loadingRequest
+                                   URL:(NSURL *)url
+                              cacheKey:(NSString *)cacheKey
+                             fromOffset:(long long)offset
+                              endOffset:(long long)endOffset;
+- (long long)nextLocalOffsetForURL:(NSURL *)url
+                           cacheKey:(NSString *)cacheKey
+                        afterOffset:(long long)offset
+                          endOffset:(long long)endOffset;
+- (void)continueLoadingRequest:(AVAssetResourceLoadingRequest *)loadingRequest context:(NSMutableDictionary<NSString *, id> *)context;
+- (void)finishLoadingRequest:(AVAssetResourceLoadingRequest *)loadingRequest
+                      context:(NSMutableDictionary<NSString *, id> *)context
+                        error:(nullable NSError *)error;
+- (NSString *)pendingKeyForRequest:(AVAssetResourceLoadingRequest *)request;
+- (void)processLoadingRequest:(AVAssetResourceLoadingRequest *)loadingRequest
+                      context:(NSMutableDictionary<NSString *, id> *)context;
 @end
 
 @implementation NLResourceLoader
 
-- (id)init {
+- (instancetype)init {
     self = [super init];
-    if (self) {
-        NSLog(@"[PlayTrace] [ResourceLoader] init, originURL=%@", self.originURL);
-        NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
-        config.HTTPMaximumConnectionsPerHost = 6;
-        config.timeoutIntervalForRequest = 30.0;
-        config.timeoutIntervalForResource = 600.0;
-        config.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+    if (!self) return nil;
 
-        NSOperationQueue *delegateQueue = [[NSOperationQueue alloc] init];
-        delegateQueue.maxConcurrentOperationCount = 1; 
+    NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
+    config.HTTPMaximumConnectionsPerHost = 6;
+    config.timeoutIntervalForRequest = 30.0;
+    config.timeoutIntervalForResource = 600.0;
+    config.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
 
-        _session = [NSURLSession sessionWithConfiguration:config
-                                                         delegate:self
-                                                    delegateQueue:delegateQueue];
-
-        _tasksMap = [NSMutableDictionary dictionary];
-        _taskRequestMap = [NSMutableDictionary dictionary];
-        _taskContextMap = [NSMutableDictionary dictionary];
-        _mapLock = [[NSLock alloc] init];
-        _cacheProgressSubject = [RACSubject subject];
-    }
+    NSOperationQueue *delegateQueue = [[NSOperationQueue alloc] init];
+    delegateQueue.maxConcurrentOperationCount = 1;
+    _session = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:delegateQueue];
+    _taskRequestMap = [NSMutableDictionary dictionary];
+    _tasksMap = [NSMutableDictionary dictionary];
+    _taskContextMap = [NSMutableDictionary dictionary];
+    _pendingRequestContextMap = [NSMutableDictionary dictionary];
+    _processingQueue = dispatch_queue_create("com.nlspotify.resource-loader.processing", DISPATCH_QUEUE_SERIAL);
+    _mapLock = [[NSLock alloc] init];
+    _cacheProgressSubject = [RACSubject subject];
+    _cacheManager = [NLCacheManager sharedManager];
     return self;
 }
 
-
 - (void)dealloc {
-    NSLog(@"[NLResourceLoader] dealloc, originURL: %@", self.originURL);
     [self.session invalidateAndCancel];
 }
 
-- (void)invalidateSession {
-    NSLog(@"[PlayTrace] [ResourceLoader] invalidateSession originURL=%@", self.originURL);
-    [self.session invalidateAndCancel];
+- (NSError *)errorWithDescription:(NSString *)description code:(NSInteger)code {
+    return [NSError errorWithDomain:@"NLResourceLoader"
+                               code:code
+                           userInfo:@{ NSLocalizedDescriptionKey: description }];
 }
 
 - (void)invalidateAndCancelAll {
-    NSLog(@"[PlayTrace] [ResourceLoader] invalidateAndCancelAll originURL=%@", self.originURL);
     [self.mapLock lock];
-
-    NSArray *allTasks = [self.tasksMap allValues];
-    for (NSURLSessionDataTask *task in allTasks) {
-        [task cancel];
+    NSArray<NSDictionary *> *contexts = [self.taskContextMap.allValues copy];
+    NSArray<NSURLSessionDataTask *> *tasks = [self.tasksMap.allValues copy];
+    NSMutableArray<AVAssetResourceLoadingRequest *> *requests = [NSMutableArray array];
+    [self.taskRequestMap enumerateKeysAndObjectsUsingBlock:^(NSNumber *taskID, AVAssetResourceLoadingRequest *request, BOOL *stop) {
+        NSMutableDictionary *context = self.taskContextMap[taskID];
+        if (![context[@"cancelled"] boolValue]) [requests addObject:request];
+    }];
+    for (NSMutableDictionary *context in self.pendingRequestContextMap.allValues) {
+        context[@"cancelled"] = @YES;
+        AVAssetResourceLoadingRequest *request = context[@"loadingRequest"];
+        if (request && ![requests containsObject:request]) [requests addObject:request];
     }
-
-    NSArray *allRequests = [self.taskRequestMap allValues];
-    for (AVAssetResourceLoadingRequest *request in allRequests) {
-        [request finishLoadingWithError:
-         [NSError errorWithDomain:NSURLErrorDomain
-                             code:NSURLErrorCancelled
-                         userInfo:nil]];
-    }
-
+    for (NSMutableDictionary *context in contexts) context[@"cancelled"] = @YES;
+    [self.pendingRequestContextMap removeAllObjects];
     [self.tasksMap removeAllObjects];
     [self.taskRequestMap removeAllObjects];
     [self.taskContextMap removeAllObjects];
-
     [self.mapLock unlock];
 
+    for (NSURLSessionDataTask *task in tasks) [task cancel];
+    NSError *error = [self errorWithDescription:@"播放请求已取消" code:NSURLErrorCancelled];
+    for (AVAssetResourceLoadingRequest *request in requests) {
+        [request finishLoadingWithError:error];
+    }
+
+    for (NSDictionary *context in contexts) {
+        dispatch_group_t group = (dispatch_group_t)context[@"writeGroup"];
+        dispatch_group_notify(group, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            NSArray *ranges = [context[@"sessionRanges"] copy];
+            NSURL *url = context[@"url"];
+            NSString *cacheKey = context[@"cacheKey"];
+            if (url && ranges.count > 0) {
+                [self.cacheManager mergeAndSaveSessionRanges:ranges
+                                                       forURL:url
+                                                     cacheKey:cacheKey
+                                                   completion:nil];
+            }
+        });
+    }
     [self.session invalidateAndCancel];
     self.session = nil;
 }
 
-#pragma mark - ResourceLoader入口
+#pragma mark - Resource loading
 
-/*
- 当AVPlayer遇到我们替换后的协议，因为他不认识，所以出发下面代理方法。我们在这里替换回http，发送请求
- 我不需要去手搓复杂的并发请求。如果你只给 AVPlayer 一部分本地数据，然后宣布 finishLoading，AVPlayer 会自动再次向你发起另一个请求要剩下的数据！这是苹果官方的隐藏黑魔法！
- */
-- (BOOL)resourceLoader:(AVAssetResourceLoader *)resourceLoader shouldWaitForLoadingOfRequestedResource:(AVAssetResourceLoadingRequest *)loadingRequest {
-    NSLog(@"[PlayTrace] [ResourceLoader] shouldWaitForLoadingOfRequestedResource: url=%@ requestedOffset=%lld requestedLength=%ld",
-    self.originURL.absoluteString,
-    loadingRequest.dataRequest.requestedOffset,
-    (long)loadingRequest.dataRequest.requestedLength);
-    NSURL *originURL = self.originURL;
-    long long requestedOffset = loadingRequest.dataRequest.requestedOffset;
-    NSInteger requestedLength = loadingRequest.dataRequest.requestedLength;
-
-    // 获取历史缓存区间
-    NSArray<NSValue *> *cachedRanges = [[NLCacheManager sharedManager] cachedRangesForURL:self.originURL];
-    long long dbTotalLength = [[NLCacheManager sharedManager] totalLengthForURL:self.originURL];
-    // 如果数据库里有文件总大小，提前给AVPlayer文件信息
-    if (dbTotalLength > 0 && loadingRequest.contentInformationRequest) {
-        loadingRequest.contentInformationRequest.contentLength = dbTotalLength;
-        loadingRequest.contentInformationRequest.contentType = @"public.mp3";
-        loadingRequest.contentInformationRequest.byteRangeAccessSupported = YES;
-    }
-//  查找缓存命中
-    NSRange targetCacheRange = NSMakeRange(NSNotFound, 0); // 用来记录有没有命中本地
-    long long nextCacheStart = NSNotFound;                 // 用来记录下一个实心块在哪
-    for (NSValue *val in cachedRanges) {
-        NSRange r = val.rangeValue;
-        // 如果要的数据，刚好落在一个已经缓存的区间里
-        if (requestedOffset >= r.location && requestedOffset < NSMaxRange(r)) {
-            targetCacheRange = r;
-            break;
-        }
-        // 如果要的数据在空洞里，顺便记一下这个空洞有多大 (下一个实心块起点在哪)
-        if (r.location > requestedOffset && (nextCacheStart == NSNotFound || r.location < nextCacheStart)) {
-            nextCacheStart = r.location;
-        }
-    }
-
-// 处理命中：播放器需要的在缓存里面
-#pragma mark - 命中本地缓存
-    if (targetCacheRange.location != NSNotFound) {
-        long long availableLocalLength = NSMaxRange(targetCacheRange) - requestedOffset;
-        NSInteger serveLength = MIN((NSInteger)availableLocalLength, requestedLength);
-
-        BOOL fullyCached = [[NLCacheManager sharedManager] isFullyCachedForURL:originURL];
-        NSString *path = fullyCached ?
-                         [[NLCacheManager sharedManager] cacheFilePathForURL:originURL] :
-                         [[NLCacheManager sharedManager] tempFilePathForURL:originURL];
-
-        int fd = open(path.UTF8String, O_RDONLY);
-        if (fd >= 0) {
-            void *buffer = malloc(serveLength);
-            ssize_t readSize = pread(fd, buffer, serveLength, requestedOffset);
-            if (readSize > 0) {
-                // 零拷贝喂给播放器
-                NSData *data = [NSData dataWithBytesNoCopy:buffer length:readSize freeWhenDone:YES];
-                [loadingRequest.dataRequest respondWithData:data];
-
-                if (readSize >= requestedLength) {
-                    if (fullyCached) {
-                        NSLog(@"[缓存] 缓存中有全部，不用请求 bytes %lld len=%zd", requestedOffset, readSize);
-                    } else {
-                        NSLog(@"[缓存] 有部分缓存，本次从本地读取 bytes %lld len=%zd，不发起请求", requestedOffset, readSize);
-                    }
-                    [loadingRequest finishLoading];
-                    close(fd);
-                    return YES;
-                } else {
-                    requestedOffset += readSize;
-                    requestedLength -= readSize;
-                    NSLog(@"[缓存] 本地仅能提供 %zd bytes，修改参数继续向网络乞讨剩余 bytes %lld - ...", readSize, requestedOffset);
-                }
-            } else {
-                free(buffer);
-            }
-            close(fd);
-        }
-    }
-// 网络请求
-    NSInteger fetchLength = requestedLength;
-    // 如果后面有个实心块，我们只下到那个实心块的前面，避免重复下载
-    if (nextCacheStart != NSNotFound && nextCacheStart < requestedOffset + requestedLength) {
-        fetchLength = (NSInteger)(nextCacheStart - requestedOffset);
-    }
-    if (cachedRanges.count == 0) {
-        NSLog(@"[缓存] 无缓存，全部请求 bytes %lld - %lld", requestedOffset, requestedOffset + fetchLength - 1);
-    } else {
-        NSLog(@"[缓存] 有部分缓存，请求部分 bytes %lld - %lld", requestedOffset, requestedOffset + fetchLength - 1);
-    }
-    NSURL *realURL = [self realURLFromLoadingRequest:loadingRequest];
-    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:realURL];
-    NSString *rangeString = [NSString stringWithFormat:@"bytes=%lld-%lld", requestedOffset, requestedOffset + fetchLength - 1];
-    [request setValue:rangeString forHTTPHeaderField:@"Range"];
-
-
-    NSURLSessionDataTask *task = [self.session dataTaskWithRequest:request];
-//  保存任务上下文
-    self.taskRequestMap[@(task.taskIdentifier)] = loadingRequest;
-    self.tasksMap[@(task.taskIdentifier)] = task;
-    // 每个任务保存自己的url
-    NSMutableDictionary *ctx = [NSMutableDictionary dictionary];
-    ctx[@"url"] = originURL;
-    ctx[@"startOffset"] = @(requestedOffset);
-    ctx[@"currentOffset"] = @(requestedOffset);
-    ctx[@"totalLength"] = @(0LL);
-    ctx[@"sessionRanges"] = [NSMutableArray array];
-    ctx[@"lastLoggedProgressPct"] = @0;
-    self.taskContextMap[@(task.taskIdentifier)] = ctx;
-    NSLog(@"[PlayTrace] [ResourceLoader] 创建数据任务 task=%@ url=%@ range=%@", task, realURL.absoluteString, rangeString);
-    [task resume];
-    return YES;
-}
-
-#pragma mark -  替换协议
 - (NSURL *)realURLFromLoadingRequest:(AVAssetResourceLoadingRequest *)loadingRequest {
     NSURLComponents *components = [NSURLComponents componentsWithURL:loadingRequest.request.URL resolvingAgainstBaseURL:NO];
-    components.scheme = self.originURL.scheme; // originURL 是我们在外面传进来的真实链接
+    components.scheme = self.originURL.scheme;
     return components.URL;
 }
 
-#pragma mark - 取消请求
-/*
- 当用户点击了下一首，刚才的任务需要停止
- */
-- (void)resourceLoader:(AVAssetResourceLoader *)resourceLoader
-didCancelLoadingRequest:(AVAssetResourceLoadingRequest *)loadingRequest {
-    [self.mapLock lock];
-    // 遍历字典，找出是哪个 Task 对应这个被取消的请求
-    __block NSNumber *targetTaskID = nil;
-    [self.taskRequestMap enumerateKeysAndObjectsUsingBlock:^(NSNumber *taskID, AVAssetResourceLoadingRequest *req, BOOL *stop) {
-        if (req == loadingRequest) {
-            targetTaskID = taskID;
-            *stop = YES;
-        }
-    }];
-    //如果找到了，取消网络请求，并从字典里清空
-    if (targetTaskID) {
-        NSURLSessionDataTask *taskToCancel = self.tasksMap[targetTaskID];
-        NSMutableDictionary *ctx = self.taskContextMap[targetTaskID];
-        [self.taskRequestMap removeObjectForKey:targetTaskID];
-        [self.tasksMap removeObjectForKey:targetTaskID];
-        [self.taskContextMap removeObjectForKey:targetTaskID];
-        [self.mapLock unlock];
-        [taskToCancel cancel];
-        NSURL *url = ctx[@"url"];
-        if (url && ctx[@"sessionRanges"] && [ctx[@"sessionRanges"] count] > 0) {
-            [[NLCacheManager sharedManager] mergeAndSaveSessionRanges:ctx[@"sessionRanges"] forURL:url];
-        }
-        return;
-    }
-    [self.mapLock unlock];
+- (NSString *)pendingKeyForRequest:(AVAssetResourceLoadingRequest *)request {
+    return [NSString stringWithFormat:@"%p", request];
 }
 
+- (BOOL)resourceLoader:(AVAssetResourceLoader *)resourceLoader
+shouldWaitForLoadingOfRequestedResource:(AVAssetResourceLoadingRequest *)loadingRequest {
+    NSURL *originURL = self.originURL;
+    AVAssetResourceLoadingDataRequest *dataRequest = loadingRequest.dataRequest;
+    if (!originURL || !dataRequest || dataRequest.requestedOffset < 0 || dataRequest.requestedLength <= 0) {
+        [loadingRequest finishLoadingWithError:[self errorWithDescription:@"无效的音频 Range 请求" code:NSURLErrorBadURL]];
+        return YES;
+    }
 
-# pragma mark - Delegate 相关
-//  收到服务器响应头 填写文件信息
-//  注意：Range 请求的 expectedContentLength 是「本次响应体」长度，不是文件总长，不能用来算缓存进度，否则第一个分片收完就会 progress=1 导致缓存条直接顶满
-- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveResponse:(NSURLResponse *)response completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
-    NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
-    NSString *contentRange = httpResponse.allHeaderFields[@"Content-Range"];
-    long long totalLength = 0;
-    if (contentRange.length > 0) {
-        NSArray *components = [contentRange componentsSeparatedByString:@"/"];
-        if (components.count == 2) {
-            NSString *totalStr = [components.lastObject stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-            if (totalStr.length > 0 && ![totalStr isEqualToString:@"*"]) {
-                totalLength = [totalStr longLongValue];
-            }
-        }
+    long long requestedOffset = dataRequest.requestedOffset;
+    long long endOffset = requestedOffset + (long long)dataRequest.requestedLength;
+    if (endOffset <= requestedOffset) {
+        [loadingRequest finishLoadingWithError:[self errorWithDescription:@"音频 Range 溢出" code:NSURLErrorBadURL]];
+        return YES;
     }
+
+    NSURL *realURL = [self realURLFromLoadingRequest:loadingRequest];
+    if (!realURL) {
+        [loadingRequest finishLoadingWithError:[self errorWithDescription:@"无效的音频播放地址" code:NSURLErrorBadURL]];
+        return YES;
+    }
+    NSMutableDictionary *context = [@{
+        @"url": originURL,
+        @"cacheKey": self.cacheKey ?: @"",
+        @"realURL": realURL,
+        @"requestedOffset": @(requestedOffset),
+        @"endOffset": @(endOffset),
+        @"loadingRequest": loadingRequest,
+        @"sessionRanges": [NSMutableArray array],
+        @"writeGroup": (id)dispatch_group_create(),
+        @"cancelled": @NO
+    } mutableCopy];
+    NSString *pendingKey = [self pendingKeyForRequest:loadingRequest];
     [self.mapLock lock];
-    AVAssetResourceLoadingRequest *loadingRequest = self.taskRequestMap[@(dataTask.taskIdentifier)];
-    NSMutableDictionary *ctx = self.taskContextMap[@(dataTask.taskIdentifier)];
+    self.pendingRequestContextMap[pendingKey] = context;
     [self.mapLock unlock];
-    if (ctx) {
-        if (totalLength <= 0) {
-            NSURL *url = ctx[@"url"];
-            if (url) {
-                totalLength = [[NLCacheManager sharedManager] totalLengthForURL:url];
-            }
-        }
-        if (totalLength <= 0) {
-            long long expected = httpResponse.expectedContentLength;
-            // 仅当明显是「全量」响应（非 Range）时才用 expectedContentLength 作为总长；Range 响应时 expected 是分片大小，不能当总长
-            BOOL likelyFullResponse = (contentRange.length == 0 && expected > 0);
-            if (likelyFullResponse) {
-                totalLength = expected;
-            }
-        }
-        ctx[@"totalLength"] = @(totalLength);
-    }
-    if (loadingRequest && loadingRequest.contentInformationRequest) {
-        long long contentLength = totalLength;
-        if (contentLength <= 0 && ctx[@"url"]) {
-            contentLength = [[NLCacheManager sharedManager] totalLengthForURL:ctx[@"url"]];
-        }
-        if (contentLength <= 0) {
-            contentLength = httpResponse.expectedContentLength > 0 ? (long long)httpResponse.expectedContentLength : 0;
-        }
-        loadingRequest.contentInformationRequest.contentLength = contentLength;
-        loadingRequest.contentInformationRequest.contentType = @"public.audio"; // 告诉它是通用音频
+
+    __weak typeof(self) weakSelf = self;
+    [self.cacheManager whenReadyOnQueue:self.processingQueue perform:^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf) [strongSelf processLoadingRequest:loadingRequest context:context];
+    }];
+    return YES;
+}
+
+- (void)processLoadingRequest:(AVAssetResourceLoadingRequest *)loadingRequest
+                      context:(NSMutableDictionary<NSString *, id> *)context {
+    NSString *pendingKey = [self pendingKeyForRequest:loadingRequest];
+    [self.mapLock lock];
+    BOOL stillPending = self.pendingRequestContextMap[pendingKey] == context && ![context[@"cancelled"] boolValue];
+    [self.mapLock unlock];
+    if (!stillPending) return;
+
+    NSURL *originURL = context[@"url"];
+    long long requestedOffset = [context[@"requestedOffset"] longLongValue];
+    long long endOffset = [context[@"endOffset"] longLongValue];
+    long long dbTotalLength = [self.cacheManager totalLengthForURL:originURL cacheKey:context[@"cacheKey"]];
+    context[@"totalLength"] = @(dbTotalLength);
+    if (dbTotalLength > 0 && loadingRequest.contentInformationRequest) {
+        loadingRequest.contentInformationRequest.contentLength = dbTotalLength;
+        loadingRequest.contentInformationRequest.contentType = @"public.audio";
         loadingRequest.contentInformationRequest.byteRangeAccessSupported = YES;
     }
-    NSURL *url = ctx[@"url"];
-    if (url && totalLength > 0) {
-        NSLog(@"[缓存] 该歌曲首次拿到总长 totalLength=%lld，已建立缓存信息", totalLength);
-        NSLog(@"[PlayTrace] [ResourceLoader] didReceiveResponse url=%@ totalLength=%lld task=%@", url.absoluteString, totalLength, dataTask);
-    } else {
-        NSLog(@"[PlayTrace] [ResourceLoader] didReceiveResponse 但未能确定 totalLength, url=%@ task=%@", url.absoluteString, dataTask);
+
+    long long cursor = [self serveLocalDataForRequest:loadingRequest
+                                                  URL:originURL
+                                             cacheKey:context[@"cacheKey"]
+                                            fromOffset:requestedOffset
+                                             endOffset:endOffset];
+    context[@"cursor"] = @(cursor);
+    if (cursor >= endOffset) {
+        [self finishLoadingRequest:loadingRequest context:context error:nil];
+        return;
+    }
+    [self continueLoadingRequest:loadingRequest context:context];
+}
+
+- (long long)serveLocalDataForRequest:(AVAssetResourceLoadingRequest *)loadingRequest
+                                   URL:(NSURL *)url
+                              cacheKey:(NSString *)cacheKey
+                             fromOffset:(long long)offset
+                              endOffset:(long long)endOffset {
+    NLCacheManager *cacheManager = self.cacheManager;
+    NSArray<NSValue *> *cachedRanges = [cacheManager cachedRangesForURL:url cacheKey:cacheKey];
+    long long cursor = offset;
+    const NSUInteger chunkSize = 512 * 1024;
+    while (cursor < endOffset) {
+        NSUInteger requestedLength = (NSUInteger)MIN(endOffset - cursor, (long long)chunkSize);
+        NSData *memoryData = [[NLAudioMemoryCache sharedCache] dataForURL:url offset:cursor length:requestedLength];
+        if (memoryData.length > 0) {
+            [loadingRequest.dataRequest respondWithData:memoryData];
+            cursor += memoryData.length;
+            continue;
+        }
+
+        NSRange targetRange = NSMakeRange(NSNotFound, 0);
+        for (NSValue *value in cachedRanges) {
+            NSRange range = value.rangeValue;
+            if (cursor >= range.location && cursor < NSMaxRange(range)) {
+                targetRange = range;
+                break;
+            }
+        }
+        if (targetRange.location == NSNotFound) break;
+
+        long long available = (long long)NSMaxRange(targetRange) - cursor;
+        NSUInteger serveLength = (NSUInteger)MIN(MIN(endOffset - cursor, available), (long long)chunkSize);
+        NSString *path = [cacheManager isFullyCachedForURL:url cacheKey:cacheKey]
+            ? [cacheManager cacheFilePathForURL:url cacheKey:cacheKey]
+            : [cacheManager tempFilePathForURL:url cacheKey:cacheKey];
+        int fd = open(path.UTF8String, O_RDONLY);
+        if (fd < 0 || serveLength == 0) {
+            if (fd >= 0) close(fd);
+            break;
+        }
+        void *buffer = malloc(serveLength);
+        if (!buffer) {
+            close(fd);
+            break;
+        }
+        ssize_t readSize = pread(fd, buffer, serveLength, cursor);
+        close(fd);
+        if (readSize <= 0) {
+            free(buffer);
+            break;
+        }
+        NSData *localData = [NSData dataWithBytesNoCopy:buffer length:(NSUInteger)readSize freeWhenDone:YES];
+        [[NLAudioMemoryCache sharedCache] storeData:localData forURL:url atOffset:cursor];
+        [loadingRequest.dataRequest respondWithData:localData];
+        cursor += readSize;
+    }
+    return cursor;
+}
+
+- (long long)nextLocalOffsetForURL:(NSURL *)url
+                           cacheKey:(NSString *)cacheKey
+                        afterOffset:(long long)offset
+                          endOffset:(long long)endOffset {
+    long long nextOffset = endOffset;
+    long long memoryOffset = [[NLAudioMemoryCache sharedCache] nextCachedOffsetForURL:url afterOffset:offset];
+    if (memoryOffset != NSNotFound) nextOffset = MIN(nextOffset, memoryOffset);
+    for (NSValue *value in [self.cacheManager cachedRangesForURL:url cacheKey:cacheKey]) {
+        NSRange range = value.rangeValue;
+        if ((long long)range.location > offset) nextOffset = MIN(nextOffset, (long long)range.location);
+    }
+    return nextOffset;
+}
+
+- (void)continueLoadingRequest:(AVAssetResourceLoadingRequest *)loadingRequest context:(NSMutableDictionary<NSString *,id> *)context {
+    [self.mapLock lock];
+    BOOL cancelledBeforeRead = [context[@"cancelled"] boolValue] || self.pendingRequestContextMap[[self pendingKeyForRequest:loadingRequest]] != context;
+    [self.mapLock unlock];
+    if (cancelledBeforeRead) return;
+    NSURL *url = context[@"url"];
+    NSString *cacheKey = context[@"cacheKey"];
+    long long endOffset = [context[@"endOffset"] longLongValue];
+    long long cursor = [self serveLocalDataForRequest:loadingRequest URL:url cacheKey:cacheKey fromOffset:[context[@"cursor"] longLongValue] endOffset:endOffset];
+    context[@"cursor"] = @(cursor);
+    if (cursor >= endOffset) {
+        [self finishLoadingRequest:loadingRequest context:context error:nil];
+        return;
+    }
+
+    long long nextOffset = [self nextLocalOffsetForURL:url cacheKey:cacheKey afterOffset:cursor endOffset:endOffset];
+    long long fetchLength = nextOffset - cursor;
+    if (fetchLength <= 0 || !self.session) {
+        [self finishLoadingRequest:loadingRequest context:context error:[self errorWithDescription:@"无法创建音频 Range 请求" code:NSURLErrorCannotConnectToHost]];
+        return;
+    }
+    context[@"startOffset"] = @(cursor);
+    context[@"currentOffset"] = @(cursor);
+    context[@"requestedLength"] = @(fetchLength);
+    context[@"respondedLength"] = @(0LL);
+    context[@"validResponse"] = @NO;
+
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:context[@"realURL"]];
+    [request setValue:[NSString stringWithFormat:@"bytes=%lld-%lld", cursor, cursor + fetchLength - 1] forHTTPHeaderField:@"Range"];
+    [request setValue:@"identity" forHTTPHeaderField:@"Accept-Encoding"];
+    NSURLSessionDataTask *task = [self.session dataTaskWithRequest:request];
+    NSNumber *taskID = @(task.taskIdentifier);
+    [self.mapLock lock];
+    BOOL cancelled = [context[@"cancelled"] boolValue] || self.pendingRequestContextMap[[self pendingKeyForRequest:loadingRequest]] != context;
+    if (!cancelled) {
+        self.taskRequestMap[taskID] = loadingRequest;
+        self.tasksMap[taskID] = task;
+        self.taskContextMap[taskID] = context;
+    }
+    [self.mapLock unlock];
+    if (cancelled) return;
+    [task resume];
+}
+
+- (void)finishLoadingRequest:(AVAssetResourceLoadingRequest *)loadingRequest
+                      context:(NSMutableDictionary<NSString *,id> *)context
+                        error:(NSError *)error {
+    NSString *pendingKey = [self pendingKeyForRequest:loadingRequest];
+    [self.mapLock lock];
+    BOOL cancelled = [context[@"cancelled"] boolValue];
+    if (self.pendingRequestContextMap[pendingKey] == context) {
+        [self.pendingRequestContextMap removeObjectForKey:pendingKey];
+    }
+    [self.mapLock unlock];
+    if (cancelled) return;
+
+    NSArray<NSValue *> *ranges = [context[@"sessionRanges"] copy];
+    NSURL *url = context[@"url"];
+    if (url && ranges.count > 0) {
+        [self.cacheManager mergeAndSaveSessionRanges:ranges forURL:url cacheKey:context[@"cacheKey"] completion:nil];
+    }
+    if (error) [loadingRequest finishLoadingWithError:error];
+    else [loadingRequest finishLoading];
+}
+#pragma mark - Cancellation
+
+- (void)resourceLoader:(AVAssetResourceLoader *)resourceLoader
+ didCancelLoadingRequest:(AVAssetResourceLoadingRequest *)loadingRequest {
+    [self.mapLock lock];
+    NSString *pendingKey = [self pendingKeyForRequest:loadingRequest];
+    NSNumber *targetTaskID = nil;
+    NSMutableDictionary *context = self.pendingRequestContextMap[pendingKey];
+    if (context) {
+        context[@"cancelled"] = @YES;
+        [self.pendingRequestContextMap removeObjectForKey:pendingKey];
+    }
+    for (NSNumber *taskID in self.taskRequestMap) {
+        if (self.taskRequestMap[taskID] == loadingRequest) {
+            targetTaskID = taskID;
+            break;
+        }
+    }
+    if (!context && targetTaskID) context = self.taskContextMap[targetTaskID];
+    if (context) context[@"cancelled"] = @YES;
+    NSURLSessionDataTask *task = targetTaskID ? self.tasksMap[targetTaskID] : nil;
+    [self.mapLock unlock];
+    [task cancel];
+}
+
+#pragma mark - NSURLSessionDataDelegate
+
+- (void)URLSession:(NSURLSession *)session
+          dataTask:(NSURLSessionDataTask *)dataTask
+didReceiveResponse:(NSURLResponse *)response
+ completionHandler:(void (^)(NSURLSessionResponseDisposition disposition))completionHandler {
+    NSNumber *taskID = @(dataTask.taskIdentifier);
+    [self.mapLock lock];
+    AVAssetResourceLoadingRequest *loadingRequest = self.taskRequestMap[taskID];
+    NSMutableDictionary *context = self.taskContextMap[taskID];
+    [self.mapLock unlock];
+    if (!context) {
+        completionHandler(NSURLSessionResponseCancel);
+        return;
+    }
+
+    long long requestedOffset = [context[@"startOffset"] longLongValue];
+    long long requestedLength = [context[@"requestedLength"] longLongValue];
+    long long responseStart = 0;
+    long long totalLength = 0;
+    BOOL valid = [NLHTTPRangeValidator validateResponse:(NSHTTPURLResponse *)response
+                                        requestedOffset:requestedOffset
+                                        requestedLength:(NSInteger)MIN(requestedLength, NSIntegerMax)
+                                          responseStart:&responseStart
+                                           totalLength:&totalLength];
+    if (!valid) {
+        NSError *error = [self errorWithDescription:@"音频服务器返回了无效的 Range 响应" code:NSURLErrorCannotParseResponse];
+        [self.mapLock lock];
+        context[@"validResponse"] = @NO;
+        context[@"terminalError"] = error;
+        [self.mapLock unlock];
+        completionHandler(NSURLSessionResponseCancel);
+        [dataTask cancel];
+        return;
+    }
+
+    [self.mapLock lock];
+    context[@"validResponse"] = @YES;
+    context[@"responseStart"] = @(responseStart);
+    context[@"totalLength"] = @(totalLength);
+    [self.mapLock unlock];
+    if (loadingRequest.contentInformationRequest) {
+        loadingRequest.contentInformationRequest.contentLength = totalLength;
+        loadingRequest.contentInformationRequest.contentType = ((NSHTTPURLResponse *)response).MIMEType ?: @"public.audio";
+        loadingRequest.contentInformationRequest.byteRangeAccessSupported = YES;
     }
     completionHandler(NSURLSessionResponseAllow);
 }
 
-- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask
-    didReceiveData:(NSData *)data {
+- (void)URLSession:(NSURLSession *)session
+          dataTask:(NSURLSessionDataTask *)dataTask
+ didReceiveData:(NSData *)data {
+    if (data.length == 0) return;
+    NSNumber *taskID = @(dataTask.taskIdentifier);
     [self.mapLock lock];
-    AVAssetResourceLoadingRequest *loadingRequest = self.taskRequestMap[@(dataTask.taskIdentifier)];
-    NSMutableDictionary *ctx = self.taskContextMap[@(dataTask.taskIdentifier)];
-    [self.mapLock unlock];
-    if (loadingRequest) {
-        [loadingRequest.dataRequest respondWithData:data];
+    AVAssetResourceLoadingRequest *loadingRequest = self.taskRequestMap[taskID];
+    NSMutableDictionary *context = self.taskContextMap[taskID];
+    if (!context || ![context[@"validResponse"] boolValue] || [context[@"cancelled"] boolValue]) {
+        [self.mapLock unlock];
+        return;
     }
-    NSURL *url = ctx[@"url"];
-    if (ctx && url && data.length > 0) {
-        long long currentOffset = [ctx[@"currentOffset"] longLongValue];
-        long long totalLength = [ctx[@"totalLength"] longLongValue];
-        [[NLCacheManager sharedManager] cacheData:data forURL:url atOffset:currentOffset totalLength:totalLength];
+
+    long long offset = [context[@"currentOffset"] longLongValue];
+    long long requestStart = [context[@"startOffset"] longLongValue];
+    long long requestedLength = [context[@"requestedLength"] longLongValue];
+    long long respondedLength = [context[@"respondedLength"] longLongValue];
+    long long totalLength = [context[@"totalLength"] longLongValue];
+    context[@"currentOffset"] = @(offset + (long long)data.length);
+
+    NSData *responseData = nil;
+    long long responseStart = MAX(offset, requestStart + respondedLength);
+    long long responseEnd = MIN(offset + (long long)data.length, requestStart + requestedLength);
+    if (responseEnd > responseStart) {
+        NSRange dataRange = NSMakeRange((NSUInteger)(responseStart - offset), (NSUInteger)(responseEnd - responseStart));
+        responseData = dataRange.length == data.length ? data : [data subdataWithRange:dataRange];
+        context[@"respondedLength"] = @(respondedLength + (long long)responseData.length);
+    }
+
+    dispatch_group_t group = (dispatch_group_t)context[@"writeGroup"];
+    NSURL *url = context[@"url"];
+    NSString *cacheKey = context[@"cacheKey"];
+    if (!url || responseData.length == 0) {
+        [self.mapLock unlock];
+        return;
+    }
+    dispatch_group_enter(group);
+    [self.mapLock unlock];
+
+    if (loadingRequest) [loadingRequest.dataRequest respondWithData:responseData];
+    [[NLAudioMemoryCache sharedCache] storeData:responseData forURL:url atOffset:responseStart];
+    [self.cacheManager cacheData:responseData
+                                      forURL:url
+                                    cacheKey:cacheKey
+                                   atOffset:responseStart
+                                totalLength:totalLength
+                                  completion:^(BOOL success) {
+        float progress = 0.f;
+        BOOL shouldSendProgress = NO;
         [self.mapLock lock];
-        NSMutableArray<NSValue *> *sessionRanges = ctx[@"sessionRanges"];
-        if ([sessionRanges isKindOfClass:[NSMutableArray class]]) {
-            [sessionRanges addObject:[NSValue valueWithRange:NSMakeRange((NSUInteger)currentOffset, data.length)]];
-        }
-        long long newOffset = currentOffset + (long long)data.length;
-        ctx[@"currentOffset"] = @(newOffset);
-        NSLog(@"[PlayTrace] [ResourceLoader] didReceiveData url=%@ currentOffset=%lld newOffset=%lld totalLength=%lld length=%lu",
-              url.absoluteString, currentOffset, newOffset, totalLength, (unsigned long)data.length);
-        // 缓存进度：每次收到数据都发 0.0~1.0，供 UIProgressView 使用（progress 范围是 0~1，不是 0~100）
-        if (totalLength > 0) {
-            // 日志仍按每 10% 打一次，避免刷屏
-            int pct = (int)((newOffset * 100) / totalLength);
-            int lastPct = [ctx[@"lastLoggedProgressPct"] intValue];
-            if (pct >= lastPct + 10 || pct >= 100) {
-                ctx[@"lastLoggedProgressPct"] = @(pct);
-                float progress = (float)newOffset / (float)totalLength;
-                progress = MIN(MAX(progress, 0.f), 1.f);
-                NSLog(@"[PlayTrace] [ResourceLoader] send cache progress=%.3f for url=%@", progress, url.absoluteString);
-                [self.cacheProgressSubject sendNext:@(progress)];
-                NSLog(@"[缓存] 下载进度 %d%% (%lld / %lld)", pct, newOffset, totalLength);
+        NSMutableArray *ranges = context[@"sessionRanges"];
+        if (success) {
+            [ranges addObject:[NSValue valueWithRange:NSMakeRange((NSUInteger)responseStart, responseData.length)]];
+            long long total = [context[@"totalLength"] longLongValue];
+            if (total > 0) {
+                progress = MIN(MAX((float)((double)(responseStart + responseData.length) / (double)total), 0.f), 1.f);
+                shouldSendProgress = YES;
             }
         }
         [self.mapLock unlock];
-    }
+        if (shouldSendProgress) [self.cacheProgressSubject sendNext:@(progress)];
+        dispatch_group_leave(group);
+    }];
 }
-
-#pragma mark - 下载结束
 
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
-    [self.mapLock lock];
     NSNumber *taskID = @(task.taskIdentifier);
-    NSMutableDictionary *ctx = self.taskContextMap[taskID];
-    AVAssetResourceLoadingRequest *loadingRequest = self.taskRequestMap[taskID];
-    [self.mapLock unlock];
-    if (loadingRequest) {
-        if (error && error.code != NSURLErrorCancelled) {
-            [loadingRequest finishLoadingWithError:error];
-        }
-        else {
-            [loadingRequest finishLoading];
-        }
-    }
-    NSURL *url = ctx[@"url"];
-    NSArray *ranges = ctx[@"sessionRanges"];
-    if (url && ranges.count > 0) {
-        long long startOffset = [ctx[@"startOffset"] longLongValue];
-        unsigned long long rangeLen = 0;
-        for (NSValue *v in ranges) rangeLen += v.rangeValue.length;
-        NSLog(@"[缓存] 请求完成 offset=%lld length=%llu%@", startOffset, rangeLen, error ? [NSString stringWithFormat:@" error=%@", error.localizedDescription] : @"");
-        [[NLCacheManager sharedManager] mergeAndSaveSessionRanges:ranges forURL:url];
-        // finishCacheForURL 由 NLCacheManager 在 merge 完成后的回调中根据 cachedRangesCoverFullLengthForURL 调用
-    }
     [self.mapLock lock];
-    [self.tasksMap removeObjectForKey:taskID];
-    [self.taskRequestMap removeObjectForKey:taskID];
+    NSMutableDictionary *context = self.taskContextMap[taskID];
+    AVAssetResourceLoadingRequest *loadingRequest = self.taskRequestMap[taskID];
     [self.taskContextMap removeObjectForKey:taskID];
+    [self.taskRequestMap removeObjectForKey:taskID];
+    [self.tasksMap removeObjectForKey:taskID];
     [self.mapLock unlock];
+    if (!context) return;
+
+    dispatch_group_notify((dispatch_group_t)context[@"writeGroup"], self.processingQueue, ^{
+        BOOL cancelled = [context[@"cancelled"] boolValue] || (error.code == NSURLErrorCancelled && !context[@"terminalError"]);
+        if (cancelled) {
+            NSString *pendingKey = [self pendingKeyForRequest:context[@"loadingRequest"]];
+            [self.mapLock lock];
+            if (self.pendingRequestContextMap[pendingKey] == context) {
+                [self.pendingRequestContextMap removeObjectForKey:pendingKey];
+            }
+            [self.mapLock unlock];
+            NSArray<NSValue *> *ranges = [context[@"sessionRanges"] copy];
+            NSURL *url = context[@"url"];
+            if (url && ranges.count > 0) {
+                [self.cacheManager mergeAndSaveSessionRanges:ranges forURL:url cacheKey:context[@"cacheKey"] completion:nil];
+            }
+            return;
+        }
+
+        NSError *terminalError = context[@"terminalError"];
+        if (terminalError) {
+            [self finishLoadingRequest:loadingRequest context:context error:terminalError];
+            return;
+        }
+        if (error) {
+            [self finishLoadingRequest:loadingRequest context:context error:error];
+            return;
+        }
+
+        long long startOffset = [context[@"startOffset"] longLongValue];
+        long long totalLength = [context[@"totalLength"] longLongValue];
+        long long expected = MIN([context[@"requestedLength"] longLongValue], totalLength - startOffset);
+        if (![context[@"validResponse"] boolValue] || expected <= 0 || [context[@"respondedLength"] longLongValue] < expected) {
+            [self finishLoadingRequest:loadingRequest
+                               context:context
+                                 error:[self errorWithDescription:@"音频 Range 数据不足" code:NSURLErrorCannotParseResponse]];
+            return;
+        }
+
+        context[@"cursor"] = @(startOffset + expected);
+        [self continueLoadingRequest:loadingRequest context:context];
+    });
 }
+
 @end

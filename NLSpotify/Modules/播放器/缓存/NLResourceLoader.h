@@ -13,6 +13,9 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface NLResourceLoader : NSObject<AVAssetResourceLoaderDelegate>
 
+/// 原始音频资源的稳定缓存身份，由歌曲 ID 与 URL 路径版本组成；为空时退回 URL 哈希。
+@property (nonatomic, copy, nullable) NSString *cacheKey;
+
 /// 原始音频资源的网络地址。
 /// - Discussion: 对应未带自定义 Scheme 的真实播放 URL。
 @property (nonatomic, strong) NSURL *originURL;

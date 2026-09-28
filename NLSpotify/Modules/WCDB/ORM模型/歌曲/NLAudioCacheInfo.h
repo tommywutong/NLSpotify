@@ -11,6 +11,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface NLAudioCacheInfo : NSObject
 @property (nonatomic, copy) NSString *urlMD5;
+@property (nonatomic, copy, nullable) NSString *songId;
 @property (nonatomic, assign) long long totalLength;
 
 //已缓存的区间 (Range) 集合：这里存一个 JSON 字符串，例如："[{\"loc\":0, \"len\":10000}, {\"loc\":50000, \"len\":8000}]"

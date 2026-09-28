@@ -99,13 +99,14 @@
             if (self.playerView.isQueuePanelVisible) {
                 [self.playerView reloadQueue];
             }
-            if (song.playURL) {
-                float cacheProgress = [[NLCacheManager sharedManager] cacheProgressForURL:song.playURL];
-                NSLog(@"[缓存条] 歌曲切换，设置缓存条 progress=%.2f", cacheProgress);
-                [self.playerView updateCacheProgress:cacheProgress];
-            } else {
-                [self.playerView updateCacheProgress:0];
-            }
+            NSString *cacheKey = [[NLCacheManager sharedManager] cacheIdentityForURL:song.playURL cacheKey:song.songId];
+            __weak typeof(self) weakSelf = self;
+            [[NLCacheManager sharedManager] whenReadyOnQueue:dispatch_get_main_queue() perform:^{
+                __strong typeof(weakSelf) strongSelf = weakSelf;
+                if (!strongSelf || NLPlayerManager.sharedManager.currentSong != song) return;
+                float cacheProgress = [[NLCacheManager sharedManager] cacheProgressForURL:song.playURL cacheKey:cacheKey];
+                [strongSelf.playerView updateCacheProgress:cacheProgress];
+            }];
 
             // 歌切换时，同步处理歌词：
             // 1）清空旧歌词；2）记录当前歌曲 ID；3）若当前在歌词模式，则自动加载新歌歌词
@@ -174,13 +175,20 @@
 
 - (void)maybeShowFullyCachedToastIfNeeded {
     NLSong *song = NLPlayerManager.sharedManager.currentSong;
-    if (!song || !song.playURL) return;
+    if (!song) return;
     NSString *key = song.songId.length > 0 ? song.songId : (song.playURL.absoluteString ?: @"");
     if (key.length == 0) return;
     if ([self.lastFullyCachedToastKey isEqualToString:key]) return;
-    if (![[NLCacheManager sharedManager] isFullyCachedForURL:song.playURL]) return;
-    self.lastFullyCachedToastKey = key;
-    [self showToast:@"该歌曲已完整缓存"];
+    NSString *cacheKey = [[NLCacheManager sharedManager] cacheIdentityForURL:song.playURL cacheKey:song.songId];
+    __weak typeof(self) weakSelf = self;
+    [[NLCacheManager sharedManager] whenReadyOnQueue:dispatch_get_main_queue() perform:^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf || NLPlayerManager.sharedManager.currentSong != song) return;
+        if ([strongSelf.lastFullyCachedToastKey isEqualToString:key]) return;
+        if (![[NLCacheManager sharedManager] isFullyCachedForURL:song.playURL cacheKey:cacheKey]) return;
+        strongSelf.lastFullyCachedToastKey = key;
+        [strongSelf showToast:@"该歌曲已完整缓存"];
+    }];
 }
 
 - (void)refreshUI {

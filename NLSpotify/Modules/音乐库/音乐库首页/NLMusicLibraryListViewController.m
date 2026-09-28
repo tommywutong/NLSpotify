@@ -31,6 +31,10 @@ static NSString * const kCellId = @"MusicLibraryCell";
 @property (nonatomic, copy) NSArray<NLPlayList *> *playlists;
 @property (nonatomic, copy) NSArray<NLAlbum *> *albums;
 @property (nonatomic, copy) NSArray<NLDownloadItem *> *downloadItems;
+@property (nonatomic, strong) NLCacheManager *cacheManager;
+@property (nonatomic, assign) NSUInteger cachedReloadToken;
+- (NSArray<NLSong *> *)cachedSongsSnapshot;
+- (void)applyCachedSongs:(NSArray<NLSong *> *)songs forToken:(NSUInteger)token;
 @end
 
 @implementation NLMusicLibraryListViewController
@@ -38,6 +42,7 @@ static NSString * const kCellId = @"MusicLibraryCell";
 - (instancetype)initWithMode:(NLMusicLibraryListMode)mode {
     if (self = [super init]) {
         _mode = mode;
+        _cacheManager = [NLCacheManager sharedManager];
     }
     return self;
 }
@@ -85,6 +90,7 @@ static NSString * const kCellId = @"MusicLibraryCell";
 - (void)viewWillDisappear:(BOOL)animated {
     [super viewWillDisappear:animated];
     if (self.mode == NLMusicLibraryListModeCachedSongs) {
+        self.cachedReloadToken += 1;
         [[NSNotificationCenter defaultCenter] removeObserver:self name:NLCacheManagerDidFinishCachingNotification object:nil];
     }
     if (self.mode == NLMusicLibraryListModeDownloadedSongs) {
@@ -169,30 +175,13 @@ static NSString * const kCellId = @"MusicLibraryCell";
             break;
         }
         case NLMusicLibraryListModeCachedSongs: {
-            NSArray<NLSong *> *history = [NLSongRepository allPlayHistory];
-            NSArray<NLSong *> *liked = [NLSongRepository allLikedSongs];
-            NSMutableDictionary<NSString *, NLSong *> *bySongId = [NSMutableDictionary dictionary];
-            for (NLSong *s in history) { if (s.songId.length) bySongId[s.songId] = s; }
-            for (NLSong *s in liked)  { if (s.songId.length) bySongId[s.songId] = s; }
-            NSMutableArray<NLSong *> *cached = [NSMutableArray array];
-            for (NLSong *s in bySongId.allValues) {
-                if (s.playURL && [[NLCacheManager sharedManager] isFullyCachedForURL:s.playURL]) {
-                    [cached addObject:s];
-                }
-            }
-            // 按缓存完成时间从新到旧排序（lastAccessTime 越大越新）
-            [cached sortUsingComparator:^NSComparisonResult(NLSong *a, NLSong *b) {
-                NSTimeInterval ta = [[NLCacheManager sharedManager] lastAccessTimeForFullyCachedURL:a.playURL];
-                NSTimeInterval tb = [[NLCacheManager sharedManager] lastAccessTimeForFullyCachedURL:b.playURL];
-                if (ta > tb) return NSOrderedAscending;
-                if (ta < tb) return NSOrderedDescending;
-                return NSOrderedSame;
+            NSUInteger token = ++self.cachedReloadToken;
+            __weak typeof(self) weakSelf = self;
+            [self.cacheManager whenReadyOnQueue:dispatch_get_global_queue(QOS_CLASS_UTILITY, 0) perform:^{
+                __strong typeof(weakSelf) strongSelf = weakSelf;
+                [strongSelf loadCachedSongsForToken:token];
             }];
-            self.songs = [cached copy];
-            self.playlists = nil;
-            self.albums = nil;
-            self.downloadItems = nil;
-            break;
+            return;
         }
         case NLMusicLibraryListModeDownloadedSongs: {
             self.songs = nil;
@@ -212,6 +201,51 @@ static NSString * const kCellId = @"MusicLibraryCell";
     [self.tableView reloadData];
     BOOL hasItems = [self rowCount] > 0;
     self.emptyStateView.hidden = hasItems;
+}
+
+- (void)loadCachedSongsForToken:(NSUInteger)token {
+    NSArray<NLSong *> *cachedSongs = [self cachedSongsSnapshot];
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        [strongSelf applyCachedSongs:cachedSongs forToken:token];
+    });
+}
+
+- (NSArray<NLSong *> *)cachedSongsSnapshot {
+    NSArray<NLSong *> *history = [NLSongRepository allPlayHistory];
+    NSArray<NLSong *> *liked = [NLSongRepository allLikedSongs];
+    NSMutableDictionary<NSString *, NLSong *> *bySongId = [NSMutableDictionary dictionary];
+    for (NLSong *song in history) { if (song.songId.length) bySongId[song.songId] = song; }
+    for (NLSong *song in liked) { if (song.songId.length) bySongId[song.songId] = song; }
+
+    NLCacheManager *cacheManager = self.cacheManager;
+    NSMutableArray<NLSong *> *cachedSongs = [NSMutableArray array];
+    NSMutableDictionary<NSString *, NSNumber *> *lastAccessBySongId = [NSMutableDictionary dictionary];
+    for (NLSong *song in bySongId.allValues) {
+        NSString *cacheKey = [cacheManager cacheIdentityForURL:song.playURL cacheKey:song.songId];
+        if (![cacheManager isFullyCachedForURL:song.playURL cacheKey:cacheKey]) continue;
+        [cachedSongs addObject:song];
+        lastAccessBySongId[song.songId] = @([cacheManager lastAccessTimeForFullyCachedURL:song.playURL cacheKey:cacheKey]);
+    }
+    [cachedSongs sortUsingComparator:^NSComparisonResult(NLSong *left, NLSong *right) {
+        NSTimeInterval leftTime = lastAccessBySongId[left.songId].doubleValue;
+        NSTimeInterval rightTime = lastAccessBySongId[right.songId].doubleValue;
+        if (leftTime > rightTime) return NSOrderedAscending;
+        if (leftTime < rightTime) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+    return [cachedSongs copy];
+}
+
+- (void)applyCachedSongs:(NSArray<NLSong *> *)songs forToken:(NSUInteger)token {
+    if (token != self.cachedReloadToken || self.mode != NLMusicLibraryListModeCachedSongs || !self.viewIfLoaded.window) return;
+    self.songs = songs;
+    self.playlists = nil;
+    self.albums = nil;
+    self.downloadItems = nil;
+    [self.tableView reloadData];
+    self.emptyStateView.hidden = self.songs.count > 0;
 }
 
 - (BOOL)isSongMode {
@@ -257,22 +291,35 @@ static NSString * const kCellId = @"MusicLibraryCell";
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     if ([self isDownloadMode]) {
-        NLDownloadItem *item = self.downloadItems[indexPath.row];
-        if (![item.status isEqualToString:@"completed"]) return;
-        NSArray<NLSong *> *allDownloaded = [NLSongRepository allDownloadedSongs];
-        NSMutableDictionary<NSString *, NLSong *> *byId = [NSMutableDictionary dictionary];
-        for (NLSong *s in allDownloaded) { if (s.songId.length) byId[s.songId] = s; }
-        NSMutableArray<NLSong *> *list = [NSMutableArray array];
-        for (NLDownloadItem *di in self.downloadItems) {
-            if (![di.status isEqualToString:@"completed"]) continue;
-            NLSong *s = byId[di.songId];
-            if (s && s.playURL) [list addObject:s];
-        }
-        NLSong *song = byId[item.songId];
-        NSInteger idx = [list indexOfObject:song];
-        if (idx != NSNotFound && idx < (NSInteger)list.count) {
-            [[NLPlayerManager sharedManager] playWithPlaylist:[list copy] startIndex:idx];
-        }
+        NLDownloadItem *selectedItem = self.downloadItems[indexPath.row];
+        if (![selectedItem.status isEqualToString:@"completed"]) return;
+        NSString *selectedSongID = [selectedItem.songId copy];
+        __weak typeof(self) weakSelf = self;
+        [[NLCacheManager sharedManager] whenReadyOnQueue:dispatch_get_main_queue() perform:^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf || !strongSelf.isViewLoaded || strongSelf.mode != NLMusicLibraryListModeDownloadedSongs) return;
+            NLDownloadItem *currentItem = nil;
+            for (NLDownloadItem *item in strongSelf.downloadItems) {
+                if ([item.songId isEqualToString:selectedSongID] && [item.status isEqualToString:@"completed"]) {
+                    currentItem = item;
+                    break;
+                }
+            }
+            if (!currentItem) return;
+            NSArray<NLSong *> *allDownloaded = [NLSongRepository allDownloadedSongs];
+            NSMutableDictionary<NSString *, NLSong *> *byId = [NSMutableDictionary dictionary];
+            for (NLSong *song in allDownloaded) { if (song.songId.length) byId[song.songId] = song; }
+            NSMutableArray<NLSong *> *list = [NSMutableArray array];
+            for (NLDownloadItem *item in strongSelf.downloadItems) {
+                if (![item.status isEqualToString:@"completed"]) continue;
+                NLSong *song = byId[item.songId];
+                NSString *cacheKey = [NLCacheManager.sharedManager cacheIdentityForURL:song.playURL cacheKey:song.songId];
+                if (song && [NLCacheManager.sharedManager isFullyCachedForURL:song.playURL cacheKey:cacheKey]) [list addObject:song];
+            }
+            NLSong *song = byId[selectedSongID];
+            NSInteger index = [list indexOfObject:song];
+            if (index != NSNotFound) [[NLPlayerManager sharedManager] playWithPlaylist:[list copy] startIndex:index];
+        }];
         return;
     }
     if ([self isSongMode]) {
@@ -280,22 +327,7 @@ static NSString * const kCellId = @"MusicLibraryCell";
         if (!song.songId.length) return;
         NSMutableArray<NLSong *> *list = [self.songs mutableCopy];
         NSInteger startIndex = indexPath.row;
-        if (song.playURL && (self.mode == NLMusicLibraryListModeCachedSongs || [[NLCacheManager sharedManager] isFullyCachedForURL:song.playURL])) {
-            if (startIndex < (NSInteger)list.count) list[startIndex].playURL = song.playURL;
-            [[NLPlayerManager sharedManager] playWithPlaylist:list startIndex:startIndex];
-            return;
-        }
-        [[NLSongService sharedService] fetchPlayableURLWithSongId:song.songId
-                                                         success:^(NSURL *playURL) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (startIndex < (NSInteger)list.count) list[startIndex].playURL = playURL;
-                [[NLPlayerManager sharedManager] playWithPlaylist:list startIndex:startIndex];
-            });
-        } failure:^(NSError *error) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                NSLog(@"获取播放链接失败 %@", error.localizedDescription);
-            });
-        }];
+        [[NLPlayerManager sharedManager] playWithPlaylist:list startIndex:startIndex];
         return;
     }
     if ([self isAlbumMode]) {
