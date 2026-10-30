@@ -7,7 +7,7 @@
 #import "NLCommentModel.h"
 #import <Masonry/Masonry.h>
 #import <SDWebImage/SDWebImage.h>
-#import "NLCommentTextFolder.h"
+#import "NLCommentTextLayout.h"
 
 @interface NLCommentCell ()
 @property (nonatomic, strong) UIImageView *avatarView;
@@ -15,6 +15,9 @@
 @property (nonatomic, strong) UILabel *contentLabel;
 @property (nonatomic, strong) UILabel *timeLabel;
 @property (nonatomic, strong) UILabel *likedLabel;
+@property (nonatomic, strong, readwrite) NLCommentModel *comment;
+@property (nonatomic, strong, readwrite) NLCommentTextLayout *textLayout;
+@property (nonatomic, strong) MASConstraint *textHeightConstraint;
 @end
 
 @implementation NLCommentCell
@@ -35,9 +38,12 @@
         [self.contentView addSubview:_nicknameLabel];
 
         _contentLabel = [[UILabel alloc] init];
-        _contentLabel.font = [UIFont systemFontOfSize:15];
+        _contentLabel.font = [[UIFontMetrics metricsForTextStyle:UIFontTextStyleBody] scaledFontForFont:[UIFont systemFontOfSize:15]];
         _contentLabel.textColor = [UIColor labelColor];
         _contentLabel.numberOfLines = 0;
+        _contentLabel.lineBreakMode = NSLineBreakByWordWrapping;
+        _contentLabel.accessibilityIdentifier = @"comment.content";
+        _contentLabel.isAccessibilityElement = YES;
         [self.contentView addSubview:_contentLabel];
 
         _timeLabel = [[UILabel alloc] init];
@@ -54,6 +60,7 @@
             make.left.equalTo(self.contentView).offset(12);
             make.top.equalTo(self.contentView).offset(12);
             make.size.mas_equalTo(CGSizeMake(40, 40));
+            make.bottom.lessThanOrEqualTo(self.contentView).offset(-12);
         }];
         [_nicknameLabel mas_makeConstraints:^(MASConstraintMaker *make) {
             make.left.equalTo(_avatarView.mas_right).offset(10);
@@ -64,6 +71,7 @@
             make.left.equalTo(_nicknameLabel);
             make.right.equalTo(self.contentView).offset(-12);
             make.top.equalTo(_nicknameLabel.mas_bottom).offset(4);
+            self.textHeightConstraint = make.height.mas_equalTo(0).priority(999);
         }];
         [_timeLabel mas_makeConstraints:^(MASConstraintMaker *make) {
             make.left.equalTo(_contentLabel);
@@ -84,58 +92,60 @@
     return self;
 }
 
++ (CGFloat)textWidthForCellWidth:(CGFloat)width {
+    return MAX(0, width - 74.0);
+}
+
 - (void)textTap {
-    self.comment.isExpanded = !self.comment.isExpanded;
-    [self updateContentLabel];
-    if (self.expandBlock) {
-        self.expandBlock();
-    }
+    if (!self.comment || !self.textLayout.needsExpansion) return;
+    if (self.expandBlock) self.expandBlock(self.comment);
 }
 
-- (void)updateContentLabel {
-    if (!self.comment) {
-        _contentLabel.text = @"";
-        return;
-    }
-    NLCommentModel *comment = self.comment;
-    CGFloat width = [UIScreen mainScreen].bounds.size.width - 74;
-    UIFont *font = [UIFont systemFontOfSize:15];
-    // 文本缓存：第一次计算折叠 / 展开富文本，后续直接复用
-    if (!comment.collapsedAttr && !comment.expandedAttr) {
-        BOOL needExpand =
-        [NLCommentTextFolder textNeedExpand:comment.content width:width font:font];
-        comment.needExpand = needExpand;
-        if (!needExpand) {
-            NSDictionary *attrs = @{
-                NSFontAttributeName : font,
-                NSForegroundColorAttributeName : [UIColor labelColor]
-            };
-            NSString *text = comment.content ?: @"";
-            comment.collapsedAttr = [[NSAttributedString alloc] initWithString:text attributes:attrs];
-        } else {
-            comment.collapsedAttr = [NLCommentTextFolder collapsedText:comment.content font:font width:width];
-            comment.expandedAttr = [NLCommentTextFolder expandedText:comment.content font:font];
-        }
-    }
-    if (!comment.needExpand) {
-        _contentLabel.attributedText = comment.collapsedAttr;
-    } else {
-        _contentLabel.attributedText = comment.isExpanded ? comment.expandedAttr : comment.collapsedAttr;
-    }
+- (BOOL)accessibilityToggle:(UIAccessibilityCustomAction *)action {
+    if (!self.comment || !self.textLayout.needsExpansion || !self.expandBlock) return NO;
+    [self textTap];
+    return YES;
 }
 
-- (void)setComment:(NLCommentModel *)comment {
-    _comment = comment;
-    [self updateContentLabel];
+- (void)configureWithComment:(NLCommentModel *)comment layout:(NLCommentTextLayout *)layout {
+    self.comment = comment;
+    self.textLayout = layout;
+    BOOL expanded = layout.needsExpansion && comment.isExpanded;
+    NSAttributedString *text = expanded ? layout.expandedText : layout.collapsedText;
+    if (_contentLabel.attributedText != text) _contentLabel.attributedText = text;
+    _contentLabel.font = layout.font;
+    [self.textHeightConstraint setOffset:expanded ? layout.expandedTextHeight : layout.collapsedTextHeight];
+    _contentLabel.accessibilityLabel = comment.content;
+    _contentLabel.accessibilityValue = layout.needsExpansion ? (expanded ? @"已展开" : @"已收起") : nil;
+    _contentLabel.accessibilityHint = layout.needsExpansion ? @"可通过操作菜单展开或收起评论" : nil;
+    _contentLabel.accessibilityCustomActions = layout.needsExpansion ? @[
+        [[UIAccessibilityCustomAction alloc] initWithName:expanded ? @"收起评论" : @"展开评论"
+                                                 target:self selector:@selector(accessibilityToggle:)]
+    ] : nil;
     _nicknameLabel.text = comment.user.nickname ?: @"匿名";
     _timeLabel.text = [self timeStringFromTimestamp:comment.time];
     _likedLabel.text = comment.likedCount > 0 ? [NSString stringWithFormat:@"♥ %ld", (long)comment.likedCount] : @"";
+    [_avatarView sd_cancelCurrentImageLoad];
+    _avatarView.image = nil;
     if (comment.user.avatarUrl.length > 0) {
         NSString *avatarUrl = [self urlStringByReplacingHttpWithHttps:comment.user.avatarUrl];
         [_avatarView sd_setImageWithURL:[NSURL URLWithString:avatarUrl] placeholderImage:nil];
-    } else {
-        _avatarView.image = nil;
     }
+}
+
+- (void)prepareForReuse {
+    [super prepareForReuse];
+    [_avatarView sd_cancelCurrentImageLoad];
+    _avatarView.image = nil;
+    self.comment = nil;
+    self.textLayout = nil;
+    self.expandBlock = nil;
+    _contentLabel.attributedText = nil;
+    _contentLabel.accessibilityLabel = nil;
+    _contentLabel.accessibilityValue = nil;
+    _contentLabel.accessibilityHint = nil;
+    _contentLabel.accessibilityCustomActions = nil;
+    [self.textHeightConstraint setOffset:0];
 }
 
 - (NSString *)urlStringByReplacingHttpWithHttps:(NSString *)urlString {

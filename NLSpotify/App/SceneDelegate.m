@@ -9,7 +9,6 @@
 #import "NLTabBarController.h"
 #import "NLLoginViewController.h"
 #import "NLAuthManager.h"
-#import "NLCacheManager.h"
 
 @interface SceneDelegate ()
 
@@ -26,6 +25,10 @@
 }
 
 - (void)showRootViewController {
+    NSError *migrationError = nil;
+    if (![NLAuthManager migrateLegacyCookieIfNeeded:&migrationError]) {
+        NSLog(@"[Auth] Keychain credential migration failed: %@", migrationError.localizedDescription ?: @"unknown error");
+    }
     if ([NLAuthManager isLoggedIn]) {
         self.window.rootViewController = [[NLTabBarController alloc] init];
     } else {
@@ -73,9 +76,6 @@
 }
 
 
-- (void)sceneDidEnterBackground:(UIScene *)scene {
-  [[NLCacheManager sharedManager] cleanCacheWithMaxSize:500 * 1024 * 1024];
-}
 
 
 @end

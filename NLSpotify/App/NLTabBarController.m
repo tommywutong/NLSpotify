@@ -84,9 +84,9 @@
     self.playerAccessory = [[UITabAccessory alloc] initWithContentView:self.playerVC.view];
     [self.playerVC didMoveToParentViewController:self];
 
-    // 无歌单时不显示小播放器，有歌单时显示
+    // 无歌单时不显示小播放器，有歌单时显示。登出重建 TabBar 时也要取消旧订阅。
     @weakify(self);
-    [[NLPlayerManager sharedManager].hasPlaylistSignal subscribeNext:^(NSNumber *hasPlaylist) {
+    [[[NLPlayerManager sharedManager].hasPlaylistSignal takeUntil:self.rac_willDeallocSignal] subscribeNext:^(NSNumber *hasPlaylist) {
         @strongify(self);
         dispatch_async(dispatch_get_main_queue(), ^{
             self.bottomAccessory = hasPlaylist.boolValue ? self.playerAccessory : nil;

@@ -26,6 +26,8 @@
 @property (nonatomic, strong) NLMusicPlayerView *playerView;
 @property (nonatomic, strong) MPVolumeView *systemVolumeView;
 @property (nonatomic, copy) NSString *lastFullyCachedToastKey;
+@property (nonatomic, assign) NSUInteger favoriteStateRequestToken;
+@property (nonatomic, assign) BOOL favoriteWriteInProgress;
 
 // 歌词
 @property (nonatomic, strong) UITableView *lyricTableView;
@@ -33,6 +35,8 @@
 @property (nonatomic, assign) NSInteger currentLyricIndex;
 @property (nonatomic, assign) BOOL lyricVisible;
 @property (nonatomic, copy) NSString *currentLyricSongId;
+@property (nonatomic, assign) NSUInteger lyricRequestToken;
+@property (nonatomic, assign) BOOL lyricPageVisible;
 @end
 
 @implementation NLMusicPlayerViewController
@@ -67,6 +71,17 @@
     [self.view addGestureRecognizer:pan];
 }
 
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    self.lyricPageVisible = YES;
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    self.lyricPageVisible = NO;
+    [self invalidatePendingLyricRequests];
+}
+
 - (void)setupConstraints {
     [self.backgroundOverlay mas_makeConstraints:^(MASConstraintMaker *make) {
         make.edges.equalTo(self.view);
@@ -86,8 +101,9 @@
         NLPlayerManager *manager = NLPlayerManager.sharedManager;
         @weakify(self);
     // 等价于__weak typeof(self) weakSelf = self;
+    // 单例 Subject 不会 completed。weakify 不断开订阅，页面销毁时用 takeUntil 移除 subscriber。
     //  歌曲信息变化
-        [manager.songSignal subscribeNext:^(NLSong *song) {
+        [[manager.songSignal takeUntil:self.rac_willDeallocSignal] subscribeNext:^(NLSong *song) {
             @strongify(self);
             if (!song) return;
             NSLog(@"[PlayTrace] [PlayerVC] songSignal 收到歌曲: %@ (%@)", song.title, song.songId);
@@ -95,7 +111,7 @@
             [self.playerView updateTitle:song.title artist:song.artist];
             [self.playerView updateCoverURL:song.coverURL];
             [self.playerView updateCurrentTime:0 totalTime:manager.totalTime];
-            [self.playerView updateFavoriteState:[NLSongRepository isSongLiked:song.songId]];
+            [self updateFavoriteStateForSong:song];
             if (self.playerView.isQueuePanelVisible) {
                 [self.playerView reloadQueue];
             }
@@ -109,43 +125,44 @@
             }];
 
             // 歌切换时，同步处理歌词：
-            // 1）清空旧歌词；2）记录当前歌曲 ID；3）若当前在歌词模式，则自动加载新歌歌词
+            // 1）使旧歌词请求失效；2）清空旧歌词；3）记录当前歌曲 ID；4）若当前在歌词模式，则自动加载新歌歌词
+            [self invalidatePendingLyricRequests];
             self.currentLyricSongId = song.songId.length ? song.songId : nil;
             self.lyricLines = nil;
             self.currentLyricIndex = -1;
             [self.lyricTableView reloadData];
             if (self.lyricVisible && song.songId.length) {
                 NSString *targetSongId = song.songId;
+                NSUInteger requestToken = [self beginLyricRequestForSongID:targetSongId];
                 [[NLSongService sharedService] fetchLyricWithSongId:targetSongId success:^(NSString *lyric) {
                     dispatch_async(dispatch_get_main_queue(), ^{
-                        // 防止快速切歌时旧歌词覆盖新歌
-                        if (![self.currentLyricSongId isEqualToString:targetSongId]) return;
+                        // 切歌、关闭歌词面板或离开播放页后的旧回调一律丢弃
+                        if (![self isLyricResponseCurrentForToken:requestToken songID:targetSongId]) return;
                         [self buildLyricLinesFromRawText:lyric];
                         [self updateLyricForCurrentTime:NLPlayerManager.sharedManager.currentTime];
                     });
                 } failure:^(NSError *error) {
                     dispatch_async(dispatch_get_main_queue(), ^{
-                        if (![self.currentLyricSongId isEqualToString:targetSongId]) return;
+                        if (![self isLyricResponseCurrentForToken:requestToken songID:targetSongId]) return;
                         [self showToast:@"歌词加载失败"];
                     });
                 }];
             }
         }];
     // 播放状态变化
-        [manager.playbackStateSignal subscribeNext:^(NSNumber *stateNum) {
+        [[manager.playbackStateSignal takeUntil:self.rac_willDeallocSignal] subscribeNext:^(NSNumber *stateNum) {
             @strongify(self);
             dispatch_async(dispatch_get_main_queue(), ^{ // ✨ 加这层
                 NSLog(@"[PlayTrace] [PlayerVC] playbackStateSignal state=%@", stateNum);
-                BOOL playing = stateNum.integerValue == NLPlaybackStatePlaying;
-                [self.playerView updatePlayState:playing];
-                if (playing) {
+                [self.playerView updatePlayState:manager.wantsToPlay];
+                if (stateNum.integerValue == NLPlaybackStatePlaying) {
                     [self maybeShowFullyCachedToastIfNeeded];
                 }
             });
         }];
 
         // 进度变化
-        [manager.progressSignal subscribeNext:^(NSNumber *progressNum) {
+        [[manager.progressSignal takeUntil:self.rac_willDeallocSignal] subscribeNext:^(NSNumber *progressNum) {
             @strongify(self);
             dispatch_async(dispatch_get_main_queue(), ^{ // 加这层
                 NSLog(@"[PlayTrace] [PlayerVC] progressSignal progress=%.3f", progressNum.floatValue);
@@ -158,7 +175,7 @@
             });
         }];
     // 缓存进度（ResourceLoader 在 NSURLSession 回调线程 sendNext，必须回主线程更新 UI）
-        [manager.cacheProgressSignal subscribeNext:^(NSNumber *progressNum) {
+        [[manager.cacheProgressSignal takeUntil:self.rac_willDeallocSignal] subscribeNext:^(NSNumber *progressNum) {
             @strongify(self);
             if (![progressNum isKindOfClass:[NSNumber class]]) return;
             float value = progressNum.floatValue;
@@ -173,6 +190,25 @@
         }];
 }
 
+
+- (void)updateFavoriteStateForSong:(NLSong *)song {
+    if (song.songId.length == 0) {
+        [self.playerView updateFavoriteState:NO];
+        return;
+    }
+    NSString *songID = [song.songId copy];
+    NSUInteger requestToken = ++self.favoriteStateRequestToken;
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        BOOL liked = [NLSongRepository isSongLiked:songID];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self || requestToken != self.favoriteStateRequestToken ||
+                ![NLPlayerManager.sharedManager.currentSong.songId isEqualToString:songID]) return;
+            [self.playerView updateFavoriteState:liked];
+        });
+    });
+}
 - (void)maybeShowFullyCachedToastIfNeeded {
     NLSong *song = NLPlayerManager.sharedManager.currentSong;
     if (!song) return;
@@ -226,10 +262,9 @@
     [self.playerView updateCurrentTime:currentTime totalTime:totalTime];
     
     [self.playerView updateVolume:NLPlayerManager.sharedManager.volume];
-    BOOL playing = NLPlayerManager.sharedManager.playbackState == NLPlaybackStatePlaying;
-    [self.playerView updatePlayState:playing];
+    [self.playerView updatePlayState:NLPlayerManager.sharedManager.wantsToPlay];
     [self.playerView updatePlayMode:NLPlayerManager.sharedManager.playMode];
-    [self.playerView updateFavoriteState:[NLSongRepository isSongLiked:song.songId]];
+    [self updateFavoriteStateForSong:song];
     // 刷新歌词选中行
     [self updateLyricForCurrentTime:NLPlayerManager.sharedManager.currentTime];
 }
@@ -266,13 +301,17 @@
     if (!song || !song.songId.length) return;
     if (!self.lyricLines || self.lyricLines.count == 0) {
         // 第一次加载歌词
-        [[NLSongService sharedService] fetchLyricWithSongId:song.songId success:^(NSString *lyric) {
+        NSString *targetSongId = song.songId;
+        NSUInteger requestToken = [self beginLyricRequestForSongID:targetSongId];
+        [[NLSongService sharedService] fetchLyricWithSongId:targetSongId success:^(NSString *lyric) {
             dispatch_async(dispatch_get_main_queue(), ^{
+                if (![self isLyricResponseCurrentForToken:requestToken songID:targetSongId]) return;
                 [self buildLyricLinesFromRawText:lyric];
                 [self showLyricView:YES];
             });
         } failure:^(NSError *error) {
             dispatch_async(dispatch_get_main_queue(), ^{
+                if (![self isLyricResponseCurrentForToken:requestToken songID:targetSongId]) return;
                 [self showToast:@"歌词加载失败"];
             });
         }];
@@ -342,11 +381,31 @@
 
 - (void)musicPlayerViewDidTapFavorite:(NLMusicPlayerView *)view {
     NLSong *song = [NLPlayerManager sharedManager].currentSong;
-    if (!song || !song.songId.length) return;
-    BOOL currentlyLiked = [NLSongRepository isSongLiked:song.songId];
-    BOOL newLiked = !currentlyLiked;
-    [NLSongRepository likeSong:song isLike:newLiked];
-    [view updateFavoriteState:newLiked];
+    if (!song || !song.songId.length || self.favoriteWriteInProgress) return;
+    self.favoriteWriteInProgress = YES;
+    NSString *songID = [song.songId copy];
+    NSUInteger requestToken = ++self.favoriteStateRequestToken;
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        BOOL currentlyLiked = [NLSongRepository isSongLiked:songID];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self) return;
+            if (requestToken != self.favoriteStateRequestToken ||
+                ![NLPlayerManager.sharedManager.currentSong.songId isEqualToString:songID]) {
+                self.favoriteWriteInProgress = NO;
+                return;
+            }
+            BOOL newLiked = !currentlyLiked;
+            [NLSongRepository likeSong:song isLike:newLiked completion:^(BOOL success) {
+                self.favoriteWriteInProgress = NO;
+                if (requestToken != self.favoriteStateRequestToken ||
+                    ![NLPlayerManager.sharedManager.currentSong.songId isEqualToString:songID]) return;
+                if (success) [view updateFavoriteState:newLiked];
+                else [self showToast:@"收藏失败，请重试"];
+            }];
+        });
+    });
 }
 
 - (void)musicPlayerViewDidTapMore:(NLMusicPlayerView *)view {
@@ -616,6 +675,7 @@
 
 - (void)showLyricView:(BOOL)show {
     self.lyricVisible = show;
+    if (!show) [self invalidatePendingLyricRequests];
     if (show) {
         // 展开中部区域为歌词模式（不影响队列按钮和列表）
         [self.playerView setLyricPanelVisible:YES animated:YES];
@@ -632,6 +692,24 @@
         }];
         [self.playerView setLyricPanelVisible:NO animated:YES];
     }
+}
+
+#pragma mark - 歌词请求代次
+
+- (NSUInteger)beginLyricRequestForSongID:(NSString *)songID {
+    self.currentLyricSongId = songID.length ? songID : nil;
+    self.lyricRequestToken += 1;
+    return self.lyricRequestToken;
+}
+
+- (void)invalidatePendingLyricRequests {
+    self.lyricRequestToken += 1;
+}
+
+- (BOOL)isLyricResponseCurrentForToken:(NSUInteger)requestToken songID:(NSString *)songID {
+    if (!self.lyricPageVisible) return NO;
+    if (!songID.length || ![self.currentLyricSongId isEqualToString:songID]) return NO;
+    return requestToken == self.lyricRequestToken;
 }
 
 - (void)updateLyricForCurrentTime:(NSTimeInterval)currentTime {

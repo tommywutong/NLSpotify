@@ -2,108 +2,109 @@
 //  NLCommentTextFolder.m
 //  NLSpotify
 //
-//  Created by 吴桐 on 2026/2/21.
-//
 
 #import "NLCommentTextFolder.h"
 
 @implementation NLCommentTextFolder
 
-+ (BOOL)textNeedExpand:(NSString *)text width:(CGFloat)width font:(UIFont *)font {
-    if (!text || text.length == 0) return NO;
++ (NSDictionary<NSAttributedStringKey, id> *)attributesForFont:(UIFont *)font {
     if (!font) font = [UIFont systemFontOfSize:15];
-    // 创建富文本，TextKit只支持富文本
-    NSDictionary *attrs = @{NSFontAttributeName: font};
-    NSAttributedString *attStr = [[NSAttributedString alloc] initWithString:text attributes:attrs];
-    NSTextStorage *textStorage = [[NSTextStorage alloc] initWithAttributedString:attStr];//textKit组件，顾名思义储存文本的
+    return @{
+        NSFontAttributeName: font,
+        NSForegroundColorAttributeName: [UIColor labelColor]
+    };
+}
+
++ (NSAttributedString *)attributedStringForText:(NSString *)text font:(UIFont *)font {
+    return [[NSAttributedString alloc] initWithString:text ?: @""
+                                            attributes:[self attributesForFont:font]];
+}
+
++ (NSUInteger)lineCountForAttributedString:(NSAttributedString *)attributedString width:(CGFloat)width {
+    if (attributedString.length == 0) return 0;
+    if (width <= 0) return NSUIntegerMax;
+    NSTextStorage *storage = [[NSTextStorage alloc] initWithAttributedString:attributedString];
     NSLayoutManager *layoutManager = [[NSLayoutManager alloc] init];
-    NSTextContainer *textContainer =
-    [[NSTextContainer alloc] initWithSize:CGSizeMake(width, CGFLOAT_MAX)];  //文本显示区域无线高度，因为你要看他有没有三行
+    NSTextContainer *container = [[NSTextContainer alloc] initWithSize:CGSizeMake(width, CGFLOAT_MAX)];
+    container.lineFragmentPadding = 0;
+    [storage addLayoutManager:layoutManager];
+    [layoutManager addTextContainer:container];
+    NSRange glyphRange = [layoutManager glyphRangeForTextContainer:container];
+    __block NSUInteger count = 0;
+    [layoutManager enumerateLineFragmentsForGlyphRange:glyphRange
+                                            usingBlock:^(CGRect rect, CGRect usedRect, NSTextContainer *textContainer, NSRange fragmentRange, BOOL *stop) {
+        count += 1;
+    }];
+    return count;
+}
 
-    textContainer.lineFragmentPadding = 0;  //  TextKit左右默认5的空间，如果不关掉行数会有误差
-    [textStorage addLayoutManager:layoutManager];
-    [layoutManager addTextContainer:textContainer];
-    [layoutManager glyphRangeForTextContainer:textContainer];
++ (BOOL)textNeedExpand:(NSString *)text width:(CGFloat)width font:(UIFont *)font {
+    if (text.length == 0 || width <= 0) return NO;
+    return [self lineCountForAttributedString:[self attributedStringForText:text font:font] width:width] > 3;
+}
 
-    NSUInteger glyphCount = layoutManager.numberOfGlyphs;
-    NSUInteger lineCount = 0;
-    NSUInteger index = 0;
-    while (index < glyphCount) {
-        NSRange lineRange;
-        [layoutManager lineFragmentRectForGlyphAtIndex:index effectiveRange:&lineRange];
-        index = NSMaxRange(lineRange);
-        lineCount++;
-    }
-    return lineCount > 3;
++ (NSArray<NSNumber *> *)composedCharacterBoundariesForText:(NSString *)text {
+    NSMutableArray<NSNumber *> *boundaries = [NSMutableArray arrayWithObject:@0];
+    [text enumerateSubstringsInRange:NSMakeRange(0, text.length)
+                             options:NSStringEnumerationByComposedCharacterSequences
+                          usingBlock:^(NSString *substring, NSRange substringRange, NSRange enclosingRange, BOOL *stop) {
+        [boundaries addObject:@(NSMaxRange(substringRange))];
+    }];
+    return boundaries;
 }
 
 + (NSAttributedString *)collapsedText:(NSString *)text font:(UIFont *)font width:(CGFloat)width {
-    if (!text || text.length == 0) {
-        return [[NSAttributedString alloc] initWithString:@""];
+    if (text.length == 0) return [self attributedStringForText:@"" font:font];
+    if (width <= 0) return [self attributedStringForText:@"" font:font];
+    if (![self textNeedExpand:text width:width font:font]) {
+        return [self attributedStringForText:text font:font];
     }
-    if (!font) font = [UIFont systemFontOfSize:15];
+
     NSString *suffix = @"...展开";
-    NSDictionary *attrs = @{NSFontAttributeName:font};
-    NSAttributedString *attrStr =
-    [[NSAttributedString alloc] initWithString:text attributes:attrs];
-    NSTextStorage *textStorage = [[NSTextStorage alloc] initWithAttributedString:attrStr];
-    NSLayoutManager *layoutManager = [[NSLayoutManager alloc] init];
-    NSTextContainer *textContainer = [[NSTextContainer alloc] initWithSize:CGSizeMake(width, CGFLOAT_MAX)];
-    textContainer.lineFragmentPadding = 0;
-    [textStorage addLayoutManager:layoutManager];
-    [layoutManager addTextContainer:textContainer];
-    [layoutManager glyphRangeForTextContainer:textContainer];
+    NSDictionary *attributes = [self attributesForFont:font];
+    NSAttributedString *(^candidate)(NSUInteger) = ^NSAttributedString *(NSUInteger end) {
+        NSString *prefix = [text substringToIndex:end];
+        NSString *value = [prefix stringByAppendingString:suffix];
+        NSMutableAttributedString *result = [[NSMutableAttributedString alloc] initWithString:value attributes:attributes];
+        [result addAttribute:NSForegroundColorAttributeName
+                       value:[UIColor systemBlueColor]
+                       range:NSMakeRange(result.length - suffix.length, suffix.length)];
+        return result;
+    };
 
-    NSUInteger glyphCount = layoutManager.numberOfGlyphs;
-    NSUInteger line = 0;
-    NSUInteger index = 0;
-    while (index < glyphCount) {
-        NSRange lineRange;
-        [layoutManager lineFragmentRectForGlyphAtIndex:index effectiveRange:&lineRange];
-        line++;
-        if (line == 3) {
-            NSUInteger endIndex = NSMaxRange(lineRange);
-            if (endIndex >= suffix.length) {
-                endIndex -= suffix.length;
-            }
-
-            NSString *subText = [text substringWithRange:[text rangeOfComposedCharacterSequencesForRange:NSMakeRange(0, endIndex)]];
-            NSString *result = [NSString stringWithFormat:@"%@%@", subText, suffix];
-            NSMutableAttributedString *attr = [[NSMutableAttributedString alloc] initWithString:result];
-
-            [attr addAttribute:NSFontAttributeName value:font range:NSMakeRange(0, attr.length)];
-            [attr addAttribute:NSForegroundColorAttributeName value:[UIColor systemBlueColor] range:NSMakeRange(attr.length - suffix.length, suffix.length)];
-            return attr;
-        }
-        index = NSMaxRange(lineRange);
+    NSAttributedString *suffixOnly = candidate(0);
+    if ([self lineCountForAttributedString:suffixOnly width:width] > 3) {
+        NSAttributedString *fallback = [[NSAttributedString alloc] initWithString:@"…" attributes:attributes];
+        return [self lineCountForAttributedString:fallback width:width] <= 3 ? fallback : [self attributedStringForText:@"" font:font];
     }
 
-    return attrStr;
+    NSArray<NSNumber *> *boundaries = [self composedCharacterBoundariesForText:text];
+    NSInteger low = 0;
+    NSInteger high = (NSInteger)boundaries.count - 1;
+    NSInteger best = 0;
+    while (low <= high) {
+        NSInteger middle = low + (high - low) / 2;
+        NSUInteger end = boundaries[middle].unsignedIntegerValue;
+        if ([self lineCountForAttributedString:candidate(end) width:width] <= 3) {
+            best = middle;
+            low = middle + 1;
+        } else {
+            high = middle - 1;
+        }
+    }
+
+    return candidate(boundaries[best].unsignedIntegerValue);
 }
 
-#pragma mark - 展开文本
-
-+ (NSAttributedString *)expandedText:(NSString *)text
-                                 font:(UIFont *)font {
-    if (!text) text = @"";
-    if (!font) font = [UIFont systemFontOfSize:15];
-    
++ (NSAttributedString *)expandedText:(NSString *)text font:(UIFont *)font {
     NSString *suffix = @" 收起";
-    NSString *result = [NSString stringWithFormat:@"%@%@", text, suffix];
-
-    NSMutableAttributedString *attr =
-    [[NSMutableAttributedString alloc] initWithString:result];
-
-    [attr addAttribute:NSFontAttributeName
-                 value:font
-                 range:NSMakeRange(0, attr.length)];
-
-    [attr addAttribute:NSForegroundColorAttributeName
-                 value:[UIColor systemBlueColor]
-                 range:NSMakeRange(attr.length - suffix.length,
-                                   suffix.length)];
-
-    return attr;
+    NSString *value = [NSString stringWithFormat:@"%@%@", text ?: @"", suffix];
+    NSMutableAttributedString *result = [[NSMutableAttributedString alloc] initWithString:value
+                                                                                 attributes:[self attributesForFont:font]];
+    [result addAttribute:NSForegroundColorAttributeName
+                   value:[UIColor systemBlueColor]
+                   range:NSMakeRange(result.length - suffix.length, suffix.length)];
+    return result;
 }
 
 @end

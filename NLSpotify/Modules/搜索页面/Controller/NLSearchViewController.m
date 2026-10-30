@@ -102,7 +102,7 @@
                     [weakSelf.categoryCollectionView reloadItemsAtIndexPaths:@[indexPath]];
                 });
             }
-        } failure:nil];
+        } failure:^(NSError *error) { (void)error; }];
     }];
 }
 
@@ -238,7 +238,7 @@
         UICollectionViewFlowLayout *layout = [[UICollectionViewFlowLayout alloc] init];
         layout.minimumLineSpacing = 12;
         layout.minimumInteritemSpacing = 12;
-        layout.itemSize = CGSizeMake(([UIScreen mainScreen].bounds.size.width - 52) / 2, 105);
+        layout.itemSize = CGSizeMake(140, 105);
         _categoryCollectionView = [[UICollectionView alloc] initWithFrame:CGRectZero collectionViewLayout:layout];
         _categoryCollectionView.backgroundColor = UIColor.clearColor;
         _categoryCollectionView.scrollEnabled = NO;

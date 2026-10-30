@@ -9,6 +9,8 @@
 #import "NLAudioMemoryCache.h"
 #import <fcntl.h>
 #import <unistd.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import <limits.h>
 
 @interface NLResourceLoader () <NSURLSessionDataDelegate>
 @property (nonatomic, strong) NSURLSession *session;
@@ -134,16 +136,20 @@
 shouldWaitForLoadingOfRequestedResource:(AVAssetResourceLoadingRequest *)loadingRequest {
     NSURL *originURL = self.originURL;
     AVAssetResourceLoadingDataRequest *dataRequest = loadingRequest.dataRequest;
-    if (!originURL || !dataRequest || dataRequest.requestedOffset < 0 || dataRequest.requestedLength <= 0) {
+    if (!originURL || (!dataRequest && !loadingRequest.contentInformationRequest) ||
+        (dataRequest && (dataRequest.requestedOffset < 0 || (!dataRequest.requestsAllDataToEndOfResource && dataRequest.requestedLength <= 0)))) {
         [loadingRequest finishLoadingWithError:[self errorWithDescription:@"无效的音频 Range 请求" code:NSURLErrorBadURL]];
         return YES;
     }
 
-    long long requestedOffset = dataRequest.requestedOffset;
-    long long endOffset = requestedOffset + (long long)dataRequest.requestedLength;
-    if (endOffset <= requestedOffset) {
-        [loadingRequest finishLoadingWithError:[self errorWithDescription:@"音频 Range 溢出" code:NSURLErrorBadURL]];
-        return YES;
+    long long requestedOffset = dataRequest ? MAX(dataRequest.requestedOffset, dataRequest.currentOffset) : 0;
+    long long endOffset = 2; // A content-information-only request probes the first bytes.
+    if (dataRequest) {
+        if (dataRequest.requestsAllDataToEndOfResource) endOffset = LLONG_MAX;
+        else if (dataRequest.requestedOffset > LLONG_MAX - dataRequest.requestedLength) {
+            [loadingRequest finishLoadingWithError:[self errorWithDescription:@"音频 Range 溢出" code:NSURLErrorBadURL]];
+            return YES;
+        } else endOffset = dataRequest.requestedOffset + dataRequest.requestedLength;
     }
 
     NSURL *realURL = [self realURLFromLoadingRequest:loadingRequest];
@@ -188,17 +194,30 @@ shouldWaitForLoadingOfRequestedResource:(AVAssetResourceLoadingRequest *)loading
     long long endOffset = [context[@"endOffset"] longLongValue];
     long long dbTotalLength = [self.cacheManager totalLengthForURL:originURL cacheKey:context[@"cacheKey"]];
     context[@"totalLength"] = @(dbTotalLength);
+    if (dbTotalLength > 0) {
+        endOffset = MIN(endOffset, dbTotalLength);
+        context[@"endOffset"] = @(endOffset);
+    }
     if (dbTotalLength > 0 && loadingRequest.contentInformationRequest) {
         loadingRequest.contentInformationRequest.contentLength = dbTotalLength;
-        loadingRequest.contentInformationRequest.contentType = @"public.audio";
+        loadingRequest.contentInformationRequest.contentType = UTTypeAudio.identifier;
         loadingRequest.contentInformationRequest.byteRangeAccessSupported = YES;
+    }
+    if (!loadingRequest.dataRequest && dbTotalLength > 0) {
+        [self finishLoadingRequest:loadingRequest context:context error:nil];
+        return;
+    }
+    if (!loadingRequest.dataRequest) {
+        context[@"cursor"] = @(0LL);
+        [self continueLoadingRequest:loadingRequest context:context];
+        return;
     }
 
     long long cursor = [self serveLocalDataForRequest:loadingRequest
                                                   URL:originURL
                                              cacheKey:context[@"cacheKey"]
                                             fromOffset:requestedOffset
-                                             endOffset:endOffset];
+                                            endOffset:endOffset];
     context[@"cursor"] = @(cursor);
     if (cursor >= endOffset) {
         [self finishLoadingRequest:loadingRequest context:context error:nil];
@@ -218,7 +237,10 @@ shouldWaitForLoadingOfRequestedResource:(AVAssetResourceLoadingRequest *)loading
     const NSUInteger chunkSize = 512 * 1024;
     while (cursor < endOffset) {
         NSUInteger requestedLength = (NSUInteger)MIN(endOffset - cursor, (long long)chunkSize);
-        NSData *memoryData = [[NLAudioMemoryCache sharedCache] dataForURL:url offset:cursor length:requestedLength];
+        NSString *memoryKey = cacheKey;
+        NSData *memoryData = memoryKey.length > 0
+            ? [[NLAudioMemoryCache sharedCache] dataForCacheKey:memoryKey offset:cursor length:requestedLength]
+            : [[NLAudioMemoryCache sharedCache] dataForURL:url offset:cursor length:requestedLength];
         if (memoryData.length > 0) {
             [loadingRequest.dataRequest respondWithData:memoryData];
             cursor += memoryData.length;
@@ -257,8 +279,9 @@ shouldWaitForLoadingOfRequestedResource:(AVAssetResourceLoadingRequest *)loading
             break;
         }
         NSData *localData = [NSData dataWithBytesNoCopy:buffer length:(NSUInteger)readSize freeWhenDone:YES];
-        [[NLAudioMemoryCache sharedCache] storeData:localData forURL:url atOffset:cursor];
         [loadingRequest.dataRequest respondWithData:localData];
+        if (cacheKey.length > 0) [[NLAudioMemoryCache sharedCache] storeData:localData cacheKey:cacheKey atOffset:cursor];
+        else [[NLAudioMemoryCache sharedCache] storeData:localData forURL:url atOffset:cursor];
         cursor += readSize;
     }
     return cursor;
@@ -269,7 +292,10 @@ shouldWaitForLoadingOfRequestedResource:(AVAssetResourceLoadingRequest *)loading
                         afterOffset:(long long)offset
                           endOffset:(long long)endOffset {
     long long nextOffset = endOffset;
-    long long memoryOffset = [[NLAudioMemoryCache sharedCache] nextCachedOffsetForURL:url afterOffset:offset];
+    NSString *memoryKey = cacheKey.length > 0 ? cacheKey : url.absoluteString;
+    long long memoryOffset = cacheKey.length > 0
+        ? [[NLAudioMemoryCache sharedCache] nextCachedOffsetForCacheKey:memoryKey afterOffset:offset]
+        : [[NLAudioMemoryCache sharedCache] nextCachedOffsetForURL:url afterOffset:offset];
     if (memoryOffset != NSNotFound) nextOffset = MIN(nextOffset, memoryOffset);
     for (NSValue *value in [self.cacheManager cachedRangesForURL:url cacheKey:cacheKey]) {
         NSRange range = value.rangeValue;
@@ -286,7 +312,12 @@ shouldWaitForLoadingOfRequestedResource:(AVAssetResourceLoadingRequest *)loading
     NSURL *url = context[@"url"];
     NSString *cacheKey = context[@"cacheKey"];
     long long endOffset = [context[@"endOffset"] longLongValue];
-    long long cursor = [self serveLocalDataForRequest:loadingRequest URL:url cacheKey:cacheKey fromOffset:[context[@"cursor"] longLongValue] endOffset:endOffset];
+    long long totalLength = [context[@"totalLength"] longLongValue];
+    if (totalLength > 0) endOffset = MIN(endOffset, totalLength);
+    if (!loadingRequest.dataRequest) endOffset = MIN(endOffset, 1LL);
+    long long cursor = loadingRequest.dataRequest
+        ? [self serveLocalDataForRequest:loadingRequest URL:url cacheKey:cacheKey fromOffset:[context[@"cursor"] longLongValue] endOffset:endOffset]
+        : [context[@"cursor"] longLongValue];
     context[@"cursor"] = @(cursor);
     if (cursor >= endOffset) {
         [self finishLoadingRequest:loadingRequest context:context error:nil];
@@ -410,7 +441,8 @@ didReceiveResponse:(NSURLResponse *)response
     [self.mapLock unlock];
     if (loadingRequest.contentInformationRequest) {
         loadingRequest.contentInformationRequest.contentLength = totalLength;
-        loadingRequest.contentInformationRequest.contentType = ((NSHTTPURLResponse *)response).MIMEType ?: @"public.audio";
+        UTType *type = [UTType typeWithMIMEType:response.MIMEType ?: @"application/octet-stream"];
+        loadingRequest.contentInformationRequest.contentType = type.identifier ?: UTTypeAudio.identifier;
         loadingRequest.contentInformationRequest.byteRangeAccessSupported = YES;
     }
     completionHandler(NSURLSessionResponseAllow);
@@ -455,8 +487,9 @@ didReceiveResponse:(NSURLResponse *)response
     dispatch_group_enter(group);
     [self.mapLock unlock];
 
-    if (loadingRequest) [loadingRequest.dataRequest respondWithData:responseData];
-    [[NLAudioMemoryCache sharedCache] storeData:responseData forURL:url atOffset:responseStart];
+    if (loadingRequest.dataRequest) [loadingRequest.dataRequest respondWithData:responseData];
+    if (cacheKey.length > 0) [[NLAudioMemoryCache sharedCache] storeData:responseData cacheKey:cacheKey atOffset:responseStart];
+    else [[NLAudioMemoryCache sharedCache] storeData:responseData forURL:url atOffset:responseStart];
     [self.cacheManager cacheData:responseData
                                       forURL:url
                                     cacheKey:cacheKey
@@ -521,6 +554,10 @@ didReceiveResponse:(NSURLResponse *)response
 
         long long startOffset = [context[@"startOffset"] longLongValue];
         long long totalLength = [context[@"totalLength"] longLongValue];
+        if (!loadingRequest.dataRequest) {
+            [self finishLoadingRequest:loadingRequest context:context error:nil];
+            return;
+        }
         long long expected = MIN([context[@"requestedLength"] longLongValue], totalLength - startOffset);
         if (![context[@"validResponse"] boolValue] || expected <= 0 || [context[@"respondedLength"] longLongValue] < expected) {
             [self finishLoadingRequest:loadingRequest

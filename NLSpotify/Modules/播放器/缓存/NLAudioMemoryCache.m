@@ -67,9 +67,13 @@ static const NSUInteger kNLAudioMemoryCacheCountLimit = 512;
 }
 
 - (void)storeData:(NSData *)data forURL:(NSURL *)url atOffset:(long long)offset {
-    if (data.length == 0 || url.absoluteString.length == 0 || offset < 0) return;
+    [self storeData:data cacheKey:url.absoluteString atOffset:offset];
+}
 
-    NSString *urlKey = url.absoluteString;
+- (void)storeData:(NSData *)data cacheKey:(NSString *)cacheKey atOffset:(long long)offset {
+    if (data.length == 0 || cacheKey.length == 0 || offset < 0) return;
+
+    NSString *urlKey = cacheKey;
     NSData *newData = [data copy];
     dispatch_sync(self.stateQueue, ^{
         NSMutableArray<NLAudioMemorySegmentDescriptor *> *descriptors = self.descriptorsByURL[urlKey];
@@ -136,9 +140,13 @@ static const NSUInteger kNLAudioMemoryCacheCountLimit = 512;
 }
 
 - (NSData *)dataForURL:(NSURL *)url offset:(long long)offset length:(NSUInteger)length {
-    if (length == 0 || url.absoluteString.length == 0 || offset < 0) return nil;
+    return [self dataForCacheKey:url.absoluteString offset:offset length:length];
+}
 
-    NSString *urlKey = url.absoluteString;
+- (NSData *)dataForCacheKey:(NSString *)cacheKey offset:(long long)offset length:(NSUInteger)length {
+    if (length == 0 || cacheKey.length == 0 || offset < 0) return nil;
+
+    NSString *urlKey = cacheKey;
     __block NSArray<NLAudioMemorySegmentDescriptor *> *descriptors = nil;
     dispatch_sync(self.stateQueue, ^{
         descriptors = [self.descriptorsByURL[urlKey] copy];
@@ -179,9 +187,13 @@ static const NSUInteger kNLAudioMemoryCacheCountLimit = 512;
 }
 
 - (long long)nextCachedOffsetForURL:(NSURL *)url afterOffset:(long long)offset {
-    if (url.absoluteString.length == 0 || offset < 0) return NSNotFound;
+    return [self nextCachedOffsetForCacheKey:url.absoluteString afterOffset:offset];
+}
 
-    NSString *urlKey = url.absoluteString;
+- (long long)nextCachedOffsetForCacheKey:(NSString *)cacheKey afterOffset:(long long)offset {
+    if (cacheKey.length == 0 || offset < 0) return NSNotFound;
+
+    NSString *urlKey = cacheKey;
     __block NSArray<NLAudioMemorySegmentDescriptor *> *descriptors = nil;
     dispatch_sync(self.stateQueue, ^{
         descriptors = [self.descriptorsByURL[urlKey] copy];
@@ -194,8 +206,12 @@ static const NSUInteger kNLAudioMemoryCacheCountLimit = 512;
 }
 
 - (void)removeDataForURL:(NSURL *)url {
-    if (url.absoluteString.length == 0) return;
-    NSString *urlKey = url.absoluteString;
+    [self removeDataForCacheKey:url.absoluteString];
+}
+
+- (void)removeDataForCacheKey:(NSString *)cacheKey {
+    if (cacheKey.length == 0) return;
+    NSString *urlKey = cacheKey;
     dispatch_sync(self.stateQueue, ^{
         NSArray<NLAudioMemorySegmentDescriptor *> *descriptors = [self.descriptorsByURL[urlKey] copy];
         [self.descriptorsByURL removeObjectForKey:urlKey];

@@ -60,4 +60,14 @@
     XCTAssertNil([self.cache dataForURL:self.url offset:100 length:1]);
 }
 
+- (void)testStableIdentityReusesSegmentsAcrossSignedURLs {
+    NSURL *first = [NSURL URLWithString:@"https://cdn.example.com/audio.mp3?token=first"];
+    NSURL *refreshed = [NSURL URLWithString:@"https://cdn.example.com/audio.mp3?token=second"];
+    [self.cache storeData:[@"abcdef" dataUsingEncoding:NSUTF8StringEncoding] cacheKey:@"song-1\ncdn.example.com/audio.mp3" atOffset:42];
+
+    XCTAssertEqualObjects([self.cache dataForCacheKey:@"song-1\ncdn.example.com/audio.mp3" offset:42 length:6], [@"abcdef" dataUsingEncoding:NSUTF8StringEncoding]);
+    XCTAssertNil([self.cache dataForCacheKey:@"song-1\ncdn.example.com/audio-lossless.mp3" offset:42 length:1]);
+    XCTAssertEqualObjects(first.host, refreshed.host);
+}
+
 @end

@@ -18,6 +18,8 @@ static NSString * const kLikedSongCellId = @"LikedSongCell";
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, copy) NSArray<NLSong *> *likedSongs;
 @property (nonatomic, strong) NSMutableSet<NSString *> *selectedSongIds;
+@property (nonatomic, assign) NSUInteger dataLoadToken;
+@property (nonatomic, assign) BOOL savingSelection;
 @end
 
 @implementation NLLikedSongsPickerViewController
@@ -41,7 +43,7 @@ static NSString * const kLikedSongCellId = @"LikedSongCell";
                                         action:@selector(backTapped)];
     self.navigationItem.rightBarButtonItem =
         [[UIBarButtonItem alloc] initWithTitle:@"完成"
-                                         style:UIBarButtonItemStyleDone
+                                         style:UIBarButtonItemStylePlain
                                         target:self
                                         action:@selector(doneTapped)];
 
@@ -54,31 +56,62 @@ static NSString * const kLikedSongCellId = @"LikedSongCell";
 }
 
 - (void)loadData {
-    self.likedSongs = [NLSongRepository allLikedSongs] ?: @[];
-    [self.tableView reloadData];
+    NSUInteger token = ++self.dataLoadToken;
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSArray<NLSong *> *songs = [NLSongRepository allLikedSongs] ?: @[];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self || token != self.dataLoadToken) return;
+            self.likedSongs = songs;
+            [self.tableView reloadData];
+        });
+    });
 }
 
 - (void)backTapped {
+    if (self.savingSelection) return;
     [self.navigationController popViewControllerAnimated:YES];
 }
 
 - (void)doneTapped {
+    if (self.savingSelection) return;
     if (self.selectedSongIds.count == 0) {
         [self.navigationController popViewControllerAnimated:YES];
         return;
     }
-    NSString *pid = self.playlist.playlistId;
-    if (!pid.length) {
+    NSString *playlistID = self.playlist.playlistId;
+    if (!playlistID.length) {
         [self.navigationController popViewControllerAnimated:YES];
         return;
     }
+    NSMutableArray<NLSong *> *selectedSongs = [NSMutableArray array];
     for (NLSong *song in self.likedSongs) {
-        if (song.songId.length == 0) continue;
-        if ([self.selectedSongIds containsObject:song.songId]) {
-            [NLPlayListRepository addSong:song toPlayList:pid];
-        }
+        if (song.songId.length && [self.selectedSongIds containsObject:song.songId]) [selectedSongs addObject:song];
     }
-    [self.navigationController popViewControllerAnimated:YES];
+    self.savingSelection = YES;
+    [self addSongs:selectedSongs toPlayList:playlistID atIndex:0];
+}
+
+- (void)addSongs:(NSArray<NLSong *> *)songs toPlayList:(NSString *)playlistID atIndex:(NSUInteger)index {
+    if (index >= songs.count) {
+        self.savingSelection = NO;
+        [self.navigationController popViewControllerAnimated:YES];
+        return;
+    }
+    NLSong *song = songs[index];
+    [NLPlayListRepository addSong:song toPlayList:playlistID completion:^(BOOL success) {
+        if (!success) {
+            self.savingSelection = NO;
+            UIAlertController *failure = [UIAlertController alertControllerWithTitle:@"添加失败"
+                                                                               message:@"歌曲未能保存到歌单，请重试。"
+                                                                        preferredStyle:UIAlertControllerStyleAlert];
+            [failure addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:failure animated:YES completion:nil];
+            return;
+        }
+        [self addSongs:songs toPlayList:playlistID atIndex:index + 1];
+    }];
 }
 
 #pragma mark - UITableViewDataSource / Delegate

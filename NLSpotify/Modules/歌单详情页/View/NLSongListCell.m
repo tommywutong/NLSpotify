@@ -19,6 +19,7 @@
 @property (nonatomic, strong) UILabel *downloadStatusLabel; /// 下载项时显示「下载中...」或「已下载」
 @property (nonatomic, strong) UIButton *moreButton;
 @property (nonatomic, strong) UIProgressView *downloadProgressView;
+@property (nonatomic, strong) UIActivityIndicatorView *downloadActivityIndicator;
 @end
 
 @implementation NLSongListCell
@@ -76,9 +77,18 @@
         _downloadProgressView.hidden = YES;
         _downloadProgressView.progressTintColor = [UIColor systemBlueColor];
         [self.contentView addSubview:_downloadProgressView];
+        _downloadActivityIndicator = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+        _downloadActivityIndicator.hidesWhenStopped = YES;
+        [_downloadActivityIndicator stopAnimating];
+        [self.contentView addSubview:_downloadActivityIndicator];
 
+        [_downloadActivityIndicator mas_makeConstraints:^(MASConstraintMaker *make) {
+            make.right.equalTo(_moreButton.mas_left).offset(-8);
+            make.centerY.equalTo(_artistLabel);
+            make.size.mas_equalTo(CGSizeMake(16, 16));
+        }];
         [_downloadStatusLabel mas_makeConstraints:^(MASConstraintMaker *make) {
-            make.right.equalTo(self.contentView).offset(-56);
+            make.right.equalTo(_downloadActivityIndicator.mas_left).offset(-6);
             make.centerY.equalTo(_artistLabel);
         }];
         [_moreButton mas_makeConstraints:^(MASConstraintMaker *make) {
@@ -98,6 +108,8 @@
 
 - (void)configWithSong:(NLListCellModel *)song {
     _downloadStatusLabel.hidden = YES;
+    _downloadProgressView.hidden = YES;
+    [_downloadActivityIndicator stopAnimating];
     _nameLabel.text = song.name ?: @"";
     _artistLabel.text = song.artistName ?: @"";
     if (song.coverUrl.length > 0) {
@@ -110,6 +122,8 @@
 
 - (void)configWithNLSong:(NLSong *)song {
     _downloadStatusLabel.hidden = YES;
+    _downloadProgressView.hidden = YES;
+    [_downloadActivityIndicator stopAnimating];
     _nameLabel.text = song.title ?: @"";
     _artistLabel.text = song.artist ?: @"";
     if (song.coverURL) {
@@ -121,6 +135,8 @@
 
 - (void)configWithPlayList:(NLPlayList *)playList {
     _downloadStatusLabel.hidden = YES;
+    _downloadProgressView.hidden = YES;
+    [_downloadActivityIndicator stopAnimating];
     _nameLabel.text = playList.name.length ? playList.name : @"歌单";
     _artistLabel.text = @"歌单";
     if (playList.coverURL.length > 0) {
@@ -133,6 +149,8 @@
 
 - (void)configWithAlbum:(NLAlbum *)album {
     _downloadStatusLabel.hidden = YES;
+    _downloadProgressView.hidden = YES;
+    [_downloadActivityIndicator stopAnimating];
     _nameLabel.text = album.name.length ? album.name : @"专辑";
     _artistLabel.text = album.artistName.length ? album.artistName : @"专辑";
     if (album.coverURL.length > 0) {
@@ -152,12 +170,25 @@
         _thumbImageView.image = nil;
         _thumbImageView.backgroundColor = [UIColor tertiarySystemFillColor];
     }
-    _downloadProgressView.hidden = YES;
     _downloadStatusLabel.hidden = NO;
+    _downloadProgressView.hidden = YES;
+    [_downloadActivityIndicator stopAnimating];
     if ([item.status isEqualToString:@"downloading"]) {
         _downloadStatusLabel.text = @"下载中...";
-    } else {
+        if (progress >= 0.f) {
+            _downloadProgressView.progress = MIN(MAX(progress, 0.f), 1.f);
+            _downloadProgressView.hidden = NO;
+        } else {
+            [_downloadActivityIndicator startAnimating];
+        }
+    } else if ([item.status isEqualToString:@"completed"]) {
         _downloadStatusLabel.text = @"已下载";
+    } else if ([item.status isEqualToString:@"paused"]) {
+        _downloadStatusLabel.text = @"已暂停";
+    } else if ([item.status isEqualToString:@"cancelled"]) {
+        _downloadStatusLabel.text = @"已取消，可重试";
+    } else {
+        _downloadStatusLabel.text = @"下载失败";
     }
 }
 

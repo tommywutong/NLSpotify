@@ -11,6 +11,7 @@
 #import "NLDataBaseManager.h"
 #import "NLAuthManager.h"
 #import "NLCacheManager.h"
+#import "NLDownloadManager.h"
 #import <IQKeyboardManager/IQKeyboardManager.h>
 @interface AppDelegate ()
 
@@ -21,7 +22,8 @@
 
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     [NLDataBaseManager sharedManager];
-    [[NLCacheManager sharedManager] cleanCacheWithMaxSize:500 * 1024 * 1024];
+    [NLDownloadManager sharedManager];
+    [NLCacheManager sharedManager];
     [IQKeyboardManager sharedManager].enableAutoToolbar = NO;
     [IQKeyboardManager sharedManager].shouldResignOnTouchOutside = YES;
     NSString *cookie = [NLAuthManager currentCookie];
@@ -31,6 +33,12 @@
         NSLog(@"[App 启动] 未取到 cookie，当前为未登录状态");
     }
     return YES;
+}
+
+- (void)application:(UIApplication *)application
+handleEventsForBackgroundURLSession:(NSString *)identifier
+  completionHandler:(void (^)(void))completionHandler {
+    [[NLDownloadManager sharedManager] handleBackgroundEventsForSessionIdentifier:identifier completionHandler:completionHandler];
 }
 
 

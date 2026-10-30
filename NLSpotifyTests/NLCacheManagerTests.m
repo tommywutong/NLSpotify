@@ -1,3 +1,4 @@
+#import <CommonCrypto/CommonDigest.h>
 #import <XCTest/XCTest.h>
 #import "NLCacheManager.h"
 #import "NLSong.h"
@@ -21,11 +22,13 @@
 - (BOOL)isDownloadingSongId:(NSString *)songId;
 - (void)addDownloadForSong:(NLSong *)song;
 - (void)cancelAllDownloads;
+- (void)removeOfflineDownloadForSongID:(NSString *)songID;
 @end
 @interface NLCacheManager (ReadinessTesting)
 - (instancetype)initWithCacheDirectory:(NSString *)cacheDirectory
                   reconciliationBlock:(void (^)(NLCacheManager *manager))reconciliationBlock;
 - (void)whenReadyOnQueue:(dispatch_queue_t)queue perform:(dispatch_block_t)block;
+- (NSString *)identifierForURL:(NSURL *)url cacheKey:(nullable NSString *)cacheKey;
 @end
 
 @interface NLCacheManager (ReconciliationTesting)
@@ -33,8 +36,17 @@
 @end
 
 @interface WCTDatabase : NSObject
+- (instancetype)initWithPath:(NSString *)path;
 - (BOOL)rawExecute:(NSString *)sql;
+- (BOOL)createTable:(NSString *)tableName withClass:(Class)modelClass;
+- (BOOL)insertOrReplaceObject:(id)object intoTable:(NSString *)tableName;
 - (NSArray *)getObjectsOfClass:(Class)cls fromTable:(NSString *)table;
+- (void)close:(nullable void (^)(void))onClosed;
+@end
+
+@interface NLDataBaseManager (NLCacheMigrationTesting)
+- (nullable instancetype)initWithDatabasePath:(NSString *)path error:(NSError **)error;
++ (void)setSharedManagerForTesting:(NLDataBaseManager *)manager;
 @end
 
 @interface NLDownloadManager (ReservationTesting)
@@ -58,6 +70,8 @@ didCompleteWithError:(NSError *)error;
 @interface NLRecordingDataRequest : NSObject
 @property (nonatomic, assign) long long requestedOffset;
 @property (nonatomic, assign) NSInteger requestedLength;
+@property (nonatomic, assign) long long currentOffset;
+@property (nonatomic, assign) BOOL requestsAllDataToEndOfResource;
 @property (nonatomic, strong) NSMutableData *receivedData;
 - (void)respondWithData:(NSData *)data;
 @end
@@ -84,6 +98,9 @@ didCompleteWithError:(NSError *)error;
 
 @interface NLCacheManagerTests : XCTestCase
 @property (nonatomic, strong) NLCacheManager *cacheManager;
+@property (nonatomic, strong) NLDataBaseManager *previousDatabaseManager;
+@property (nonatomic, strong) NLDataBaseManager *legacyTestDatabaseManager;
+@property (nonatomic, copy) NSString *legacyTestDirectory;
 @end
 
 @interface NLListTestCacheManager : NLCacheManager
@@ -163,7 +180,7 @@ didCompleteWithError:(NSError *)error;
     NSString *songID = NSUUID.UUID.UUIDString;
     NLSong *song = [[NLSong alloc] initWithId:songID title:@"queue-responsive" artist:@"test" coverURL:[NSURL URLWithString:@"https://example.com/cover.png"]];
     song.playURL = [self uniqueURL];
-    XCTAssertTrue([NLSongRepository addPlayHistory:song]);
+    XCTAssertTrue([self recordPlaybackStartAndWaitForSong:song]);
 
     NSString *directory = [NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
     NLListTestCacheManager *fake = [[NLListTestCacheManager alloc] initWithCacheDirectory:directory reconciliationBlock:nil];
@@ -202,7 +219,7 @@ didCompleteWithError:(NSError *)error;
     [self waitUntil:^BOOL{ return fake.completedQueryCount > 0; } message:@"blocked cache query should finish after the heartbeat"];
     [self waitUntil:^BOOL{ return [[controller valueForKey:@"songs"] count] == 1; } message:@"current cached snapshot should reach the list"];
 
-    [NLSongRepository removePlayHistoryWithSongId:songID];
+    [self removePlayHistoryAndWaitForSongID:songID];
     window.hidden = YES;
     window.rootViewController = nil;
     [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
@@ -215,8 +232,8 @@ didCompleteWithError:(NSError *)error;
     NLSong *newer = [[NLSong alloc] initWithId:newerID title:@"newer" artist:@"test" coverURL:[NSURL URLWithString:@"https://example.com/cover.png"]];
     older.playURL = [self uniqueURL];
     newer.playURL = [self uniqueURL];
-    XCTAssertTrue([NLSongRepository addPlayHistory:older]);
-    XCTAssertTrue([NLSongRepository addPlayHistory:newer]);
+    XCTAssertTrue([self recordPlaybackStartAndWaitForSong:older]);
+    XCTAssertTrue([self recordPlaybackStartAndWaitForSong:newer]);
 
     NSString *directory = [NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
     NLListTestCacheManager *fake = [[NLListTestCacheManager alloc] initWithCacheDirectory:directory reconciliationBlock:nil];
@@ -247,8 +264,8 @@ didCompleteWithError:(NSError *)error;
     XCTAssertEqual(emptySnapshot.count, 0u);
     XCTAssertEqual(fake.lastAccessQueryCount, 0u);
 
-    [NLSongRepository removePlayHistoryWithSongId:olderID];
-    [NLSongRepository removePlayHistoryWithSongId:newerID];
+    [self removePlayHistoryAndWaitForSongID:olderID];
+    [self removePlayHistoryAndWaitForSongID:newerID];
     [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
 }
 
@@ -262,7 +279,7 @@ didCompleteWithError:(NSError *)error;
     NSString *songID = NSUUID.UUID.UUIDString;
     NLSong *historySong = [[NLSong alloc] initWithId:songID title:@"pending stale" artist:@"test" coverURL:[NSURL URLWithString:@"https://example.com/cover.png"]];
     historySong.playURL = [self uniqueURL];
-    XCTAssertTrue([NLSongRepository addPlayHistory:historySong]);
+    XCTAssertTrue([self recordPlaybackStartAndWaitForSong:historySong]);
     NLMusicLibraryListViewController *controller = [[NLMusicLibraryListViewController alloc] initWithMode:NLMusicLibraryListModeCachedSongs];
     [controller setValue:fake forKey:@"cacheManager"];
     UIWindowScene *scene = (UIWindowScene *)UIApplication.sharedApplication.connectedScenes.allObjects.firstObject;
@@ -295,13 +312,23 @@ didCompleteWithError:(NSError *)error;
     window.hidden = YES;
     dispatch_semaphore_signal(fake.releaseQuery);
     [self waitUntil:^BOOL{ return !fake.blockedQueryInFlight; } message:@"stale cache query should finish after release"];
-    [NLSongRepository removePlayHistoryWithSongId:songID];
+    [self removePlayHistoryAndWaitForSongID:songID];
     [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
 }
 
 - (void)setUp {
     [super setUp];
     self.cacheManager = [NLCacheManager sharedManager];
+    self.previousDatabaseManager = [NLDataBaseManager sharedManager];
+}
+
+- (void)tearDown {
+    if (self.legacyTestDatabaseManager) {
+        [NLDataBaseManager setSharedManagerForTesting:self.previousDatabaseManager];
+        [self.legacyTestDatabaseManager.database close:nil];
+        [[NSFileManager defaultManager] removeItemAtPath:self.legacyTestDirectory error:nil];
+    }
+    [super tearDown];
 }
 
 - (void)testCacheIdentityUsesStableURLPathButIgnoresExpiringQuery {
@@ -312,6 +339,35 @@ didCompleteWithError:(NSError *)error;
     XCTAssertEqualObjects(firstIdentity, [self.cacheManager cacheIdentityForURL:sameVariant cacheKey:@"song-1"]);
     XCTAssertNotEqualObjects(firstIdentity, [self.cacheManager cacheIdentityForURL:differentVariant cacheKey:@"song-1"]);
 }
+- (BOOL)performRepositoryWriteAndWait:(void (^)(void (^completion)(BOOL success)))write {
+    XCTestExpectation *finished = [self expectationWithDescription:@"Repository write finished"];
+    __block BOOL result = NO;
+    write(^(BOOL success) {
+        result = success;
+        [finished fulfill];
+    });
+    [self waitForExpectations:@[finished] timeout:5];
+    return result;
+}
+
+- (BOOL)recordPlaybackStartAndWaitForSong:(NLSong *)song {
+    return [self performRepositoryWriteAndWait:^(void (^completion)(BOOL)) {
+        [NLSongRepository recordPlaybackStart:song completion:completion];
+    }];
+}
+
+- (BOOL)removePlayHistoryAndWaitForSongID:(NSString *)songID {
+    return [self performRepositoryWriteAndWait:^(void (^completion)(BOOL)) {
+        [NLSongRepository removePlayHistoryWithSongId:songID completion:completion];
+    }];
+}
+
+- (BOOL)removeDownloadAndWaitForSongID:(NSString *)songID {
+    return [self performRepositoryWriteAndWait:^(void (^completion)(BOOL)) {
+        [NLDownloadRepository removeDownloadItemWithSongId:songID completion:completion];
+    }];
+}
+
 
 - (NSURL *)uniqueURL {
     return [NSURL URLWithString:[NSString stringWithFormat:@"https://example.com/audio-%@.mp3", NSUUID.UUID.UUIDString]];
@@ -325,40 +381,245 @@ didCompleteWithError:(NSError *)error;
     XCTAssertTrue(condition(), @"%@", message);
 }
 
-- (void)testPartialDiskCacheIsRemovedByPartialTierCleanup {
-    NSURL *url = [self uniqueURL];
-    NSData *data = [@"partial" dataUsingEncoding:NSUTF8StringEncoding];
-    [self.cacheManager cacheData:data forURL:url atOffset:0 totalLength:100];
-
-    [self waitUntil:^BOOL{
-        return [[NSFileManager defaultManager] fileExistsAtPath:[self.cacheManager tempFilePathForURL:url]];
-    } message:@"L2 temporary cache file should be written before cleanup"];
-
-    [self.cacheManager cleanPartialCacheWithMaxSize:0];
-
-    [self waitUntil:^BOOL{
-        return ![[NSFileManager defaultManager] fileExistsAtPath:[self.cacheManager tempFilePathForURL:url]];
-    } message:@"L2 cleanup should remove incomplete temporary files"];
-    XCTAssertFalse([self.cacheManager isFullyCachedForURL:url]);
+- (NSString *)prepareCapacityCacheDirectory {
+    self.legacyTestDirectory = [NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
+    NSString *directory = [self.legacyTestDirectory stringByAppendingPathComponent:@"AudioCache"];
+    XCTAssertTrue([[NSFileManager defaultManager] createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil]);
+    self.legacyTestDatabaseManager = [[NLDataBaseManager alloc] initWithDatabasePath:[self.legacyTestDirectory stringByAppendingPathComponent:@"Quota.sqlite"] error:nil];
+    XCTAssertNotNil(self.legacyTestDatabaseManager);
+    [NLDataBaseManager setSharedManagerForTesting:self.legacyTestDatabaseManager];
+    XCTAssertTrue([self.legacyTestDatabaseManager.database createTable:NLAudioCacheInfoTableName withClass:NLAudioCacheInfo.class]);
+    return directory;
 }
 
-- (void)testCompleteDiskCacheIsRemovedByCompleteTierCleanup {
+- (NSString *)seedCapacityFileAtDirectory:(NSString *)directory URL:(NSURL *)url size:(NSUInteger)size finished:(BOOL)finished recency:(NSTimeInterval)recency {
+    NSString *identifier = [self.cacheManager identifierForURL:url cacheKey:nil];
+    NSString *path = [directory stringByAppendingPathComponent:[identifier stringByAppendingString:finished ? @".mp3" : @".tmp"]];
+    XCTAssertTrue([[NSFileManager defaultManager] createFileAtPath:path contents:nil attributes:nil]);
+    NSFileHandle *file = [NSFileHandle fileHandleForWritingAtPath:path];
+    [file truncateFileAtOffset:size]; // Sparse fixtures exercise quotas without allocating hundreds of MiB.
+    [file closeFile];
+    NSString *ranges = finished ? [NSString stringWithFormat:@"[{\"loc\":0,\"len\":%lu}]", (unsigned long)size] : @"[]";
+    NLAudioCacheInfo *info = [self infoWithIdentifier:identifier songID:NSUUID.UUID.UUIDString totalLength:(long long)size cachedRangesString:ranges isFinished:finished];
+    info.lastAccessTime = recency;
+    XCTAssertTrue([self.legacyTestDatabaseManager.database insertOrReplaceObject:info intoTable:NLAudioCacheInfoTableName]);
+    return path;
+}
+
+- (void)startCapacityManagerAtDirectory:(NSString *)directory {
+    self.cacheManager = [[NLCacheManager alloc] initWithCacheDirectory:directory reconciliationBlock:nil];
+    XCTestExpectation *ready = [self expectationWithDescription:@"capacity manager ready"];
+    [self.cacheManager whenReadyOnQueue:dispatch_get_main_queue() perform:^{ [ready fulfill]; }];
+    [self waitForExpectations:@[ready] timeout:5];
+}
+
+- (void)waitForCapacityOperations {
+    dispatch_queue_t queue = [self.cacheManager valueForKey:@"admissionQueue"];
+    [self waitUntil:^BOOL{
+        __block BOOL idle = NO;
+        dispatch_sync(queue, ^{
+            BOOL scheduled = [self.cacheManager respondsToSelector:NSSelectorFromString(@"capacityCleanupScheduled")] &&
+                [[self.cacheManager valueForKey:@"capacityCleanupScheduled"] boolValue];
+            idle = [[self.cacheManager valueForKey:@"inFlightCacheOperationCount"] unsignedIntegerValue] == 0 && !scheduled;
+        });
+        return idle;
+    } message:@"cache writes and capacity cleanup should settle"];
+}
+
+- (void)writeCapacityByteForURL:(NSURL *)url offset:(long long)offset totalLength:(long long)totalLength {
+    XCTestExpectation *written = [self expectationWithDescription:@"capacity byte written"];
+    [self.cacheManager cacheData:[@"x" dataUsingEncoding:NSUTF8StringEncoding] forURL:url cacheKey:nil atOffset:offset totalLength:totalLength completion:^(BOOL success) {
+        XCTAssertTrue(success);
+        [written fulfill];
+    }];
+    [self waitForExpectations:@[written] timeout:5];
+    [self waitForCapacityOperations];
+}
+
+- (void)testPromotionCommitFailureIsNotSuccessAndRetryIsIdempotent {
+    NSString *directory = [self prepareCapacityCacheDirectory];
+    [self startCapacityManagerAtDirectory:directory];
     NSURL *url = [self uniqueURL];
-    NSData *data = [@"complete" dataUsingEncoding:NSUTF8StringEncoding];
-    [self.cacheManager cacheData:data forURL:url atOffset:0 totalLength:(long long)data.length];
-    [self.cacheManager mergeAndSaveSessionRanges:@[[NSValue valueWithRange:NSMakeRange(0, data.length)]] forURL:url];
-
-    [self waitUntil:^BOOL{
-        return [self.cacheManager isFullyCachedForURL:url];
-    } message:@"L3 complete cache should be promoted from L2 after full coverage"];
-    XCTAssertFalse([[NSFileManager defaultManager] fileExistsAtPath:[self.cacheManager tempFilePathForURL:url]]);
-
-    [self.cacheManager cleanCompletedCacheWithMaxSize:0];
-
-    [self waitUntil:^BOOL{
-        return ![[NSFileManager defaultManager] fileExistsAtPath:[self.cacheManager cacheFilePathForURL:url]];
-    } message:@"L3 cleanup should remove complete files independently"];
+    NSData *audio = [@"committed-audio" dataUsingEncoding:NSUTF8StringEncoding];
+    XCTestExpectation *written = [self expectationWithDescription:@"body written"];
+    [self.cacheManager cacheData:audio forURL:url cacheKey:nil atOffset:0 totalLength:audio.length completion:^(BOOL success) {
+        XCTAssertTrue(success);
+        [written fulfill];
+    }];
+    [self waitForExpectations:@[written] timeout:5];
+    WCTDatabase *database = self.legacyTestDatabaseManager.database;
+    XCTAssertTrue([database rawExecute:@"CREATE TRIGGER TestPromotionCommit BEFORE INSERT ON AudioCacheInfoTable_v3 WHEN NEW.isFinished = 1 BEGIN SELECT RAISE(ABORT, 'commit failure'); END"]);
+    XCTestExpectation *failed = [self expectationWithDescription:@"commit rejected"];
+    [self.cacheManager mergeAndSaveSessionRanges:@[[NSValue valueWithRange:NSMakeRange(0, audio.length)]] forURL:url cacheKey:nil completion:^(BOOL complete) {
+        XCTAssertFalse(complete);
+        [failed fulfill];
+    }];
+    [self waitForExpectations:@[failed] timeout:5];
     XCTAssertFalse([self.cacheManager isFullyCachedForURL:url]);
+    XCTAssertEqualObjects([NSData dataWithContentsOfFile:[self.cacheManager tempFilePathForURL:url]], audio);
+    XCTAssertFalse([[[database getObjectsOfClass:NLAudioCacheInfo.class fromTable:NLAudioCacheInfoTableName] firstObject] isFinished]);
+    XCTAssertTrue([database rawExecute:@"DROP TRIGGER TestPromotionCommit"]);
+    for (NSUInteger attempt = 0; attempt < 2; attempt++) {
+        XCTestExpectation *finished = [self expectationWithDescription:@"commit or repeat completion"];
+        [self.cacheManager finishCacheForURL:url cacheKey:nil completion:^(BOOL complete) {
+            XCTAssertTrue(complete);
+            [finished fulfill];
+        }];
+        [self waitForExpectations:@[finished] timeout:5];
+        XCTAssertTrue([self.cacheManager isFullyCachedForURL:url]);
+        XCTAssertEqualObjects([NSData dataWithContentsOfFile:[self.cacheManager cacheFilePathForURL:url]], audio);
+    }
+    [self waitForCapacityOperations];
+}
+
+- (void)testCommittedFlagCannotOverrideIncompleteLedger {
+    NSString *directory = [self prepareCapacityCacheDirectory];
+    [self startCapacityManagerAtDirectory:directory];
+    NSURL *url = [self uniqueURL];
+    NSString *identifier = [self.cacheManager identifierForURL:url cacheKey:nil];
+    NLAudioCacheInfo *info = [self infoWithIdentifier:identifier songID:@"incomplete" totalLength:5 cachedRangesString:@"[{\"loc\":0,\"len\":4}]" isFinished:YES];
+    XCTAssertTrue([self insertCacheInfoForTest:info]);
+    NSString *path = [self.cacheManager cacheFilePathForURL:url];
+    XCTAssertTrue([[@"audio" dataUsingEncoding:NSUTF8StringEncoding] writeToFile:path atomically:NO]);
+    XCTAssertFalse([self.cacheManager isFullyCachedForURL:url]);
+    XCTAssertFalse([self.cacheManager isFullyCachedForURL:nil cacheKey:info.songId]);
+    [self.cacheManager reconcileCacheDirectory];
+    XCTAssertFalse([[NSFileManager defaultManager] fileExistsAtPath:path]);
+    XCTAssertEqual([self.legacyTestDatabaseManager.database getObjectsOfClass:NLAudioCacheInfo.class fromTable:NLAudioCacheInfoTableName].count, 0u);
+}
+
+- (void)testReconcileRemovesTruncatedCommittedBody {
+    NSString *directory = [self prepareCapacityCacheDirectory];
+    [self startCapacityManagerAtDirectory:directory];
+    NSURL *url = [self uniqueURL];
+    NLAudioCacheInfo *info = [self infoWithIdentifier:[self.cacheManager identifierForURL:url cacheKey:nil] songID:@"truncated" totalLength:5 cachedRangesString:@"[{\"loc\":0,\"len\":5}]" isFinished:YES];
+    XCTAssertTrue([self insertCacheInfoForTest:info]);
+    NSString *path = [self.cacheManager cacheFilePathForURL:url];
+    XCTAssertTrue([[@"bad" dataUsingEncoding:NSUTF8StringEncoding] writeToFile:path atomically:NO]);
+    XCTAssertFalse([self.cacheManager isFullyCachedForURL:url]);
+    [self.cacheManager reconcileCacheDirectory];
+    XCTAssertFalse([[NSFileManager defaultManager] fileExistsAtPath:path]);
+    XCTAssertEqual([self.legacyTestDatabaseManager.database getObjectsOfClass:NLAudioCacheInfo.class fromTable:NLAudioCacheInfoTableName].count, 0u);
+}
+
+- (void)testStartupCommitsCompletePartialBody {
+    NSString *directory = [self prepareCapacityCacheDirectory];
+    NSURL *url = [self uniqueURL];
+    NSString *identifier = [self.cacheManager identifierForURL:url cacheKey:nil];
+    NSData *audio = [@"audio" dataUsingEncoding:NSUTF8StringEncoding];
+    NLAudioCacheInfo *info = [self infoWithIdentifier:identifier songID:@"startup-complete" totalLength:audio.length cachedRangesString:@"[{\"loc\":0,\"len\":5}]" isFinished:NO];
+    XCTAssertTrue([self insertCacheInfoForTest:info]);
+    NSString *partial = [directory stringByAppendingPathComponent:[identifier stringByAppendingString:@".tmp"]];
+    XCTAssertTrue([audio writeToFile:partial atomically:NO]);
+    [self startCapacityManagerAtDirectory:directory];
+    XCTAssertTrue([self.cacheManager isFullyCachedForURL:url]);
+    XCTAssertEqualObjects([NSData dataWithContentsOfFile:[self.cacheManager cacheFilePathForURL:url]], audio);
+    XCTAssertFalse([[NSFileManager defaultManager] fileExistsAtPath:partial]);
+}
+
+- (void)testRenamedUncommittedBodyCanFinishWithoutTempFile {
+    NSString *directory = [self prepareCapacityCacheDirectory];
+    [self startCapacityManagerAtDirectory:directory];
+    NSURL *url = [self uniqueURL];
+    NSData *audio = [@"audio" dataUsingEncoding:NSUTF8StringEncoding];
+    NLAudioCacheInfo *info = [self infoWithIdentifier:[self.cacheManager identifierForURL:url cacheKey:nil] songID:@"pending-commit" totalLength:audio.length cachedRangesString:@"[{\"loc\":0,\"len\":5}]" isFinished:NO];
+    XCTAssertTrue([self insertCacheInfoForTest:info]);
+    XCTAssertTrue([audio writeToFile:[self.cacheManager cacheFilePathForURL:url] atomically:NO]);
+    XCTAssertFalse([self.cacheManager isFullyCachedForURL:url]);
+    XCTestExpectation *finished = [self expectationWithDescription:@"renamed body committed"];
+    [self.cacheManager finishCacheForURL:url cacheKey:nil completion:^(BOOL complete) {
+        XCTAssertTrue(complete);
+        [finished fulfill];
+    }];
+    [self waitForExpectations:@[finished] timeout:5];
+    XCTAssertTrue([self.cacheManager isFullyCachedForURL:url]);
+    XCTAssertEqualObjects([NSData dataWithContentsOfFile:[self.cacheManager cacheFilePathForURL:url]], audio);
+    [self waitForCapacityOperations];
+}
+
+- (void)testPartialCapacityCrossingTrimsToLowWatermarkAndProtectsCurrentPlayback {
+    NSUInteger mib = 1024 * 1024;
+    NSString *directory = [self prepareCapacityCacheDirectory];
+    NSURL *oldest = [self uniqueURL], *older = [self uniqueURL], *playing = [self uniqueURL], *newest = [self uniqueURL];
+    NSString *firstPath = [self seedCapacityFileAtDirectory:directory URL:oldest size:10 * mib finished:NO recency:1];
+    NSString *secondPath = [self seedCapacityFileAtDirectory:directory URL:older size:10 * mib finished:NO recency:2];
+    NSString *playingPath = [self seedCapacityFileAtDirectory:directory URL:playing size:88 * mib finished:NO recency:0];
+    [self startCapacityManagerAtDirectory:directory];
+    self.cacheManager.currentPlayingURL = playing;
+    [self writeCapacityByteForURL:newest offset:20 * mib - 1 totalLength:40 * mib];
+    XCTAssertFalse([[NSFileManager defaultManager] fileExistsAtPath:firstPath]);
+    XCTAssertFalse([[NSFileManager defaultManager] fileExistsAtPath:secondPath]);
+    XCTAssertTrue([[NSFileManager defaultManager] fileExistsAtPath:playingPath]);
+    XCTAssertTrue([[NSFileManager defaultManager] fileExistsAtPath:[self.cacheManager tempFilePathForURL:newest]]);
+    // 128 MiB must fall below 115.2 MiB, not stop at 118 MiB after deleting only one file.
+}
+
+- (void)testPromotionTriggersCompletedCapacityCleanupWithoutEvictingPartialTier {
+    NSUInteger mib = 1024 * 1024;
+    NSString *directory = [self prepareCapacityCacheDirectory];
+    NSURL *first = [self uniqueURL], *second = [self uniqueURL], *playing = [self uniqueURL], *promoting = [self uniqueURL], *partial = [self uniqueURL];
+    NSString *firstPath = [self seedCapacityFileAtDirectory:directory URL:first size:30 * mib finished:YES recency:1];
+    NSString *secondPath = [self seedCapacityFileAtDirectory:directory URL:second size:30 * mib finished:YES recency:2];
+    NSString *playingPath = [self seedCapacityFileAtDirectory:directory URL:playing size:430 * mib finished:YES recency:0];
+    NSString *partialPath = [self seedCapacityFileAtDirectory:directory URL:partial size:2 * mib finished:NO recency:0];
+    [self startCapacityManagerAtDirectory:directory];
+    self.cacheManager.currentPlayingURL = playing;
+    [self writeCapacityByteForURL:promoting offset:10 * mib - 1 totalLength:10 * mib];
+    XCTestExpectation *promoted = [self expectationWithDescription:@"quota promotion"];
+    [self.cacheManager mergeAndSaveSessionRanges:@[[NSValue valueWithRange:NSMakeRange(0, 10 * mib)]] forURL:promoting cacheKey:nil completion:^(BOOL completed) {
+        XCTAssertTrue(completed);
+        [promoted fulfill];
+    }];
+    [self waitForExpectations:@[promoted] timeout:5];
+    [self waitForCapacityOperations];
+    XCTAssertFalse([[NSFileManager defaultManager] fileExistsAtPath:firstPath]);
+    XCTAssertFalse([[NSFileManager defaultManager] fileExistsAtPath:secondPath]);
+    XCTAssertTrue([[NSFileManager defaultManager] fileExistsAtPath:playingPath]);
+    XCTAssertTrue([[NSFileManager defaultManager] fileExistsAtPath:partialPath]);
+    XCTAssertTrue([self.cacheManager isFullyCachedForURL:promoting]);
+}
+
+- (void)testOverwriteDoesNotCountAlreadyCachedBytesTwice {
+    NSUInteger mib = 1024 * 1024;
+    NSString *directory = [self prepareCapacityCacheDirectory];
+    NSURL *old = [self uniqueURL], *current = [self uniqueURL];
+    NSString *oldPath = [self seedCapacityFileAtDirectory:directory URL:old size:100 * mib finished:NO recency:1];
+    [self startCapacityManagerAtDirectory:directory];
+    [self writeCapacityByteForURL:current offset:27 * mib - 1 totalLength:40 * mib];
+    [self writeCapacityByteForURL:current offset:27 * mib - 1 totalLength:40 * mib];
+    XCTAssertTrue([[NSFileManager defaultManager] fileExistsAtPath:oldPath]);
+    XCTAssertEqual([[[NSFileManager defaultManager] attributesOfItemAtPath:[self.cacheManager tempFilePathForURL:current] error:nil][NSFileSize] unsignedLongLongValue], 27ULL * mib);
+}
+
+- (void)testStartupOverQuotaWaitsForMutationAndProtectedFilesMayRemainOverQuota {
+    NSUInteger mib = 1024 * 1024;
+    NSString *directory = [self prepareCapacityCacheDirectory];
+    NSURL *old = [self uniqueURL], *playing = [self uniqueURL], *newest = [self uniqueURL];
+    NSString *oldPath = [self seedCapacityFileAtDirectory:directory URL:old size:10 * mib finished:NO recency:1];
+    NSString *playingPath = [self seedCapacityFileAtDirectory:directory URL:playing size:130 * mib finished:NO recency:0];
+    [self startCapacityManagerAtDirectory:directory];
+    [self waitForCapacityOperations];
+    XCTAssertTrue([[NSFileManager defaultManager] fileExistsAtPath:oldPath]);
+    self.cacheManager.currentPlayingURL = playing;
+    [self writeCapacityByteForURL:newest offset:0 totalLength:10];
+    XCTAssertFalse([[NSFileManager defaultManager] fileExistsAtPath:oldPath]);
+    XCTAssertTrue([[NSFileManager defaultManager] fileExistsAtPath:playingPath]);
+}
+
+- (void)testClearResetsCapacityAccountingBeforeNewWrites {
+    NSUInteger mib = 1024 * 1024;
+    NSString *directory = [self prepareCapacityCacheDirectory];
+    NSURL *old = [self uniqueURL], *newest = [self uniqueURL];
+    NSString *oldPath = [self seedCapacityFileAtDirectory:directory URL:old size:120 * mib finished:NO recency:1];
+    [self startCapacityManagerAtDirectory:directory];
+    XCTestExpectation *cleared = [self expectationWithDescription:@"capacity cleared"];
+    id observer = [[NSNotificationCenter defaultCenter] addObserverForName:NLCacheManagerDidFinishCachingNotification object:self.cacheManager queue:nil usingBlock:^(NSNotification *note) { [cleared fulfill]; }];
+    [self.cacheManager clearAllCache];
+    [self waitForExpectations:@[cleared] timeout:5];
+    [[NSNotificationCenter defaultCenter] removeObserver:observer];
+    [self writeCapacityByteForURL:newest offset:20 * mib - 1 totalLength:40 * mib];
+    XCTAssertFalse([[NSFileManager defaultManager] fileExistsAtPath:oldPath]);
+    XCTAssertTrue([[NSFileManager defaultManager] fileExistsAtPath:[self.cacheManager tempFilePathForURL:newest]]);
 }
 
 
@@ -413,10 +674,11 @@ didCompleteWithError:(NSError *)error;
         [merged fulfill];
     }];
     [self waitForExpectations:@[merged] timeout:5];
-
+    XCTAssertEqual([self.cacheManager cachedRangesForURL:url cacheKey:cacheKey].count, 2u);
+    XCTAssertTrue([[NSFileManager defaultManager] fileExistsAtPath:[self.cacheManager tempFilePathForURL:url cacheKey:cacheKey]]);
     NLAudioMemoryCache *memoryCache = [NLAudioMemoryCache sharedCache];
-    [memoryCache storeData:[@"abc" dataUsingEncoding:NSUTF8StringEncoding] forURL:url atOffset:0];
-    [memoryCache storeData:[@"ghi" dataUsingEncoding:NSUTF8StringEncoding] forURL:url atOffset:6];
+    [memoryCache storeData:[@"abc" dataUsingEncoding:NSUTF8StringEncoding] cacheKey:cacheKey atOffset:0];
+    [memoryCache storeData:[@"ghi" dataUsingEncoding:NSUTF8StringEncoding] cacheKey:cacheKey atOffset:6];
     NLRecordingDataRequest *dataRequest = [[NLRecordingDataRequest alloc] init];
     dataRequest.requestedOffset = 0;
     dataRequest.requestedLength = 10;
@@ -437,7 +699,7 @@ didCompleteWithError:(NSError *)error;
     XCTAssertNil(request.error);
     XCTAssertEqualObjects(request.dataRequest.receivedData, [@"abcdefghij" dataUsingEncoding:NSUTF8StringEncoding]);
     [loader invalidateAndCancelAll];
-    [memoryCache removeDataForURL:url];
+    [memoryCache removeDataForCacheKey:cacheKey];
 }
 
 
@@ -477,18 +739,14 @@ didCompleteWithError:(NSError *)error;
 }
 
 - (BOOL)insertCacheInfoForTest:(NLAudioCacheInfo *)info {
-    NSString *sql = [NSString stringWithFormat:@"INSERT OR REPLACE INTO AudioCacheInfoTable (urlMD5, songId, totalLength, cachedRangesString, lastAccessTime, isFinished) VALUES ('%@', '%@', %lld, '%@', %.0f, %d)",
-                     info.urlMD5, info.songId, info.totalLength, info.cachedRangesString, info.lastAccessTime, info.isFinished];
-    return [[NLDataBaseManager sharedManager].database rawExecute:sql];
+    return [[NLDataBaseManager sharedManager].database insertOrReplaceObject:info intoTable:@"AudioCacheInfoTable_v3"];
 }
 
 - (void)finishReconciliationFixtureWithManager:(NLCacheManager *)manager
                                            info:(NLAudioCacheInfo *)info
                                       directory:(NSString *)directory {
-    if (info.urlMD5.length) {
-        NSString *sql = [NSString stringWithFormat:@"DELETE FROM AudioCacheInfoTable WHERE urlMD5 = '%@'", info.urlMD5];
-        [[NLDataBaseManager sharedManager].database rawExecute:sql];
-    }
+    NSString *deleteSQL = [NSString stringWithFormat:@"DELETE FROM AudioCacheInfoTable_v3 WHERE cacheIdentifier = '%@'", info.cacheIdentifier];
+    [[NLDataBaseManager sharedManager].database rawExecute:deleteSQL];
     [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
 }
 
@@ -506,7 +764,7 @@ didCompleteWithError:(NSError *)error;
     XCTAssertTrue([audio writeToFile:path atomically:NO]);
 
     NLAudioCacheInfo *info = [[NLAudioCacheInfo alloc] init];
-    info.urlMD5 = [[path lastPathComponent] stringByDeletingPathExtension];
+    info.cacheIdentifier = [[path lastPathComponent] stringByDeletingPathExtension];
     info.songId = songID;
     info.totalLength = (long long)audio.length;
     info.cachedRangesString = [NSString stringWithFormat:@"[{\"loc\":0,\"len\":%lu}]", (unsigned long)audio.length];
@@ -537,7 +795,7 @@ didCompleteWithError:(NSError *)error;
     NSString *path = [manager cacheFilePathForURL:url cacheKey:songID];
     XCTAssertTrue([audio writeToFile:path atomically:NO]);
     NLAudioCacheInfo *info = [[NLAudioCacheInfo alloc] init];
-    info.urlMD5 = [[path lastPathComponent] stringByDeletingPathExtension];
+    info.cacheIdentifier = [[path lastPathComponent] stringByDeletingPathExtension];
     info.songId = songID;
     info.totalLength = (long long)audio.length;
     info.cachedRangesString = [NSString stringWithFormat:@"[{\"loc\":0,\"len\":%lu}]", (unsigned long)audio.length - 1];
@@ -567,7 +825,7 @@ didCompleteWithError:(NSError *)error;
     NSString *path = [manager cacheFilePathForURL:url cacheKey:songID];
     XCTAssertTrue([[audio subdataWithRange:NSMakeRange(0, audio.length - 1)] writeToFile:path atomically:NO]);
     NLAudioCacheInfo *info = [[NLAudioCacheInfo alloc] init];
-    info.urlMD5 = [[path lastPathComponent] stringByDeletingPathExtension];
+    info.cacheIdentifier = [[path lastPathComponent] stringByDeletingPathExtension];
     info.songId = songID;
     info.totalLength = (long long)audio.length;
     info.cachedRangesString = [NSString stringWithFormat:@"[{\"loc\":0,\"len\":%lu}]", (unsigned long)audio.length];
@@ -597,7 +855,7 @@ didCompleteWithError:(NSError *)error;
     NSString *path = [manager cacheFilePathForURL:url cacheKey:songID];
     XCTAssertTrue([audio writeToFile:path atomically:NO]);
     NLAudioCacheInfo *info = [[NLAudioCacheInfo alloc] init];
-    info.urlMD5 = [[path lastPathComponent] stringByDeletingPathExtension];
+    info.cacheIdentifier = [[path lastPathComponent] stringByDeletingPathExtension];
     info.songId = songID;
     info.totalLength = (long long)audio.length;
     info.cachedRangesString = [NSString stringWithFormat:@"[{\"loc\":0,\"len\":%lu}]", (unsigned long)audio.length];
@@ -605,7 +863,7 @@ didCompleteWithError:(NSError *)error;
     XCTAssertTrue([self insertCacheInfoForTest:info]);
 
     NSString *triggerName = [NSString stringWithFormat:@"TestAudioRepair%@", [[NSUUID UUID].UUIDString stringByReplacingOccurrencesOfString:@"-" withString:@""]];
-    NSString *triggerSQL = [NSString stringWithFormat:@"CREATE TRIGGER %@ BEFORE INSERT ON AudioCacheInfoTable WHEN NEW.urlMD5 = '%@' AND NEW.isFinished = 1 BEGIN SELECT RAISE(ABORT, 'test repair failure'); END", triggerName, info.urlMD5];
+    NSString *triggerSQL = [NSString stringWithFormat:@"CREATE TRIGGER %@ BEFORE INSERT ON AudioCacheInfoTable_v3 WHEN NEW.cacheIdentifier = '%@' AND NEW.isFinished = 1 BEGIN SELECT RAISE(ABORT, 'test repair failure'); END", triggerName, info.cacheIdentifier];
     XCTAssertTrue([[NLDataBaseManager sharedManager].database rawExecute:triggerSQL]);
 
     XCTestExpectation *ready = [self expectationWithDescription:@"reconciliation finished"];
@@ -614,8 +872,8 @@ didCompleteWithError:(NSError *)error;
     [self waitForExpectations:@[ready] timeout:5];
 
     NLAudioCacheInfo *persisted = nil;
-    for (NLAudioCacheInfo *candidate in [[NLDataBaseManager sharedManager].database getObjectsOfClass:NLAudioCacheInfo.class fromTable:@"AudioCacheInfoTable"]) {
-        if ([candidate.urlMD5 isEqualToString:info.urlMD5]) {
+    for (NLAudioCacheInfo *candidate in [[NLDataBaseManager sharedManager].database getObjectsOfClass:NLAudioCacheInfo.class fromTable:@"AudioCacheInfoTable_v3"]) {
+        if ([candidate.cacheIdentifier isEqualToString:info.cacheIdentifier]) {
             persisted = candidate;
             break;
         }
@@ -794,38 +1052,20 @@ didCompleteWithError:(NSError *)error;
     [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
 }
 
-- (void)testCancelAllBeforeCacheReadyDoesNotStartDownload {
-    NSString *directory = [NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
-    XCTestExpectation *entered = [self expectationWithDescription:@"download reconciliation entered"];
-    dispatch_semaphore_t resume = nil;
-    NLCacheManager *cacheManager = [self newCacheManagerAtPath:directory entered:entered resume:&resume];
-    [self waitForExpectations:@[entered] timeout:3];
-
-    NLDownloadManager *manager = nil;
-    XCTAssertNoThrow(manager = [[NLDownloadManager alloc] init]);
-    if (!manager) {
-        dispatch_semaphore_signal(resume);
-        [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
-        return;
-    }
-    [manager setValue:cacheManager forKey:@"cacheManager"];
+- (void)testCancelAllReleasesActiveBackgroundDownloads {
+    NLDownloadManager *manager = [[NLDownloadManager alloc] init];
     NSString *songID = NSUUID.UUID.UUIDString;
     NLSong *song = [[NLSong alloc] initWithId:songID title:@"pending" artist:@"test" coverURL:[NSURL URLWithString:@"https://example.com/cover.jpg"]];
-    song.playURL = [NSURL URLWithString:@"http://127.0.0.1:1/should-not-start.mp3"];
+    song.playURL = [NSURL URLWithString:@"http://127.0.0.1:1/cancelled-download.mp3"];
     [manager addDownloadForSong:song];
     XCTAssertTrue([manager isDownloadingSongId:songID]);
 
     [manager cancelAllDownloads];
-    XCTAssertFalse([manager isDownloadingSongId:songID]);
-    XCTestExpectation *ready = [self expectationWithDescription:@"download callback drained after reconciliation"];
-    [cacheManager whenReadyOnQueue:dispatch_get_main_queue() perform:^{ [ready fulfill]; }];
-    dispatch_semaphore_signal(resume);
-    [self waitForExpectations:@[ready] timeout:5];
+    [self waitUntil:^BOOL { return ![manager isDownloadingSongId:songID] && [[manager valueForKey:@"taskMap"] count] == 0; }
+             message:@"cancelled background download should release its active task"];
 
-    XCTAssertFalse([manager isDownloadingSongId:songID]);
-    XCTAssertNil([NLDownloadRepository downloadItemForSongId:songID]);
-    XCTAssertEqual([[manager valueForKey:@"taskMap"] count], 0u);
-    [[NSFileManager defaultManager] removeItemAtPath:directory error:nil];
+    [manager removeOfflineDownloadForSongID:songID];
+    [self removeDownloadAndWaitForSongID:songID];
 }
 
 - (void)testCancelledLoadingRequestDoesNotReadMemoryBeforeReconciliationCompletes {
@@ -897,5 +1137,161 @@ didCompleteWithError:(NSError *)error;
         return pending.count == 0;
     } message:@"cancelled URLSession completion should remove pending loader context"];
     [loader invalidateAndCancelAll];
+}
+
+- (NLAudioCacheInfo *)infoWithIdentifier:(NSString *)identifier
+                                  songID:(NSString *)songID
+                             totalLength:(long long)totalLength
+                       cachedRangesString:(NSString *)cachedRangesString
+                             isFinished:(BOOL)isFinished {
+    NLAudioCacheInfo *info = [[NLAudioCacheInfo alloc] init];
+    info.cacheIdentifier = identifier;
+    info.songId = songID;
+    info.totalLength = totalLength;
+    info.cachedRangesString = cachedRangesString;
+    info.lastAccessTime = 1234;
+    info.isFinished = isFinished;
+    return info;
+}
+
+- (NSString *)sha256HexForString:(NSString *)value {
+    NSData *bytes = [value dataUsingEncoding:NSUTF8StringEncoding];
+    NSMutableString *hex = [NSMutableString stringWithCapacity:bytes.length * 2];
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(bytes.bytes, (CC_LONG)bytes.length, digest);
+    for (NSUInteger index = 0; index < CC_SHA256_DIGEST_LENGTH; index++) {
+        [hex appendFormat:@"%02x", digest[index]];
+    }
+    return hex;
+}
+
+- (void)installLegacyCacheDatabaseWithSongID:(NSString *)songID
+                              cacheIdentifier:(NSString *)cacheIdentifier
+                                        audio:(NSData *)audio
+                                  totalLength:(long long)totalLength
+                              cachedRangesJSON:(NSString *)rangesJSON
+                                    isFinished:(BOOL)isFinished {
+    self.legacyTestDirectory = [NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
+    NSString *cacheDirectory = [self.legacyTestDirectory stringByAppendingPathComponent:@"AudioCache"];
+    NSString *databasePath = [self.legacyTestDirectory stringByAppendingPathComponent:@"Legacy.sqlite"];
+    NSError *directoryError = nil;
+    BOOL created = [[NSFileManager defaultManager] createDirectoryAtPath:cacheDirectory
+                                             withIntermediateDirectories:YES
+                                                              attributes:nil
+                                                                   error:&directoryError];
+    XCTAssertTrue(created, @"%@", directoryError.localizedDescription);
+
+    WCTDatabase *legacyDatabase = [[WCTDatabase alloc] initWithPath:databasePath];
+    XCTAssertTrue([legacyDatabase rawExecute:@"CREATE TABLE AudioCacheInfoTable (urlMD5 TEXT PRIMARY KEY, songId TEXT, totalLength INTEGER, cachedRangesString TEXT, lastAccessTime REAL, isFinished INTEGER)"]);
+    NSString *escapedRanges = [rangesJSON stringByReplacingOccurrencesOfString:@"'" withString:@"''"];
+    NSString *insertSQL = [NSString stringWithFormat:@"INSERT INTO AudioCacheInfoTable (urlMD5, songId, totalLength, cachedRangesString, lastAccessTime, isFinished) VALUES ('%@', '%@', %lld, '%@', 1234, %d)",
+                           cacheIdentifier, songID, totalLength, escapedRanges, isFinished];
+    XCTAssertTrue([legacyDatabase rawExecute:insertSQL]);
+    NSString *suffix = isFinished ? @".mp3" : @".tmp";
+    NSString *audioPath = [cacheDirectory stringByAppendingPathComponent:[cacheIdentifier stringByAppendingString:suffix]];
+    XCTAssertTrue([audio writeToFile:audioPath atomically:NO]);
+    [legacyDatabase close:nil];
+
+    NSError *databaseError = nil;
+    self.legacyTestDatabaseManager = [[NLDataBaseManager alloc] initWithDatabasePath:databasePath error:&databaseError];
+    XCTAssertNotNil(self.legacyTestDatabaseManager, @"%@", databaseError.localizedDescription);
+    [NLDataBaseManager setSharedManagerForTesting:self.legacyTestDatabaseManager];
+    self.cacheManager = [[NLCacheManager alloc] initWithCacheDirectory:cacheDirectory reconciliationBlock:nil];
+
+    XCTestExpectation *ready = [self expectationWithDescription:@"legacy cache migration and reconciliation finished"];
+    [self.cacheManager whenReadyOnQueue:dispatch_get_main_queue() perform:^{ [ready fulfill]; }];
+    [self waitForExpectations:@[ready] timeout:5];
+}
+
+- (void)assertLegacyCacheTableWasRemoved {
+    NSString *sql = @"INSERT INTO AudioCacheInfoTable (urlMD5) VALUES ('must-not-exist')";
+    XCTAssertFalse([self.legacyTestDatabaseManager.database rawExecute:sql]);
+}
+
+- (void)testNewCacheIdentifierUsesSHA256PrefixAndStableIdentity {
+    NSURL *url = [NSURL URLWithString:@"https://cdn.example.com/audio/high.mp3?token=one"];
+    NSString *identifier = [self.cacheManager identifierForURL:url cacheKey:@"song-1"];
+
+    XCTAssertTrue([identifier hasPrefix:@"sha256-"], @"identifier should carry the algorithm prefix: %@", identifier);
+    NSString *hex = [identifier substringFromIndex:@"sha256-".length];
+    XCTAssertEqual(hex.length, 64u);
+    XCTAssertEqualObjects(hex, hex.lowercaseString);
+    NSCharacterSet *invalid = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdef"] invertedSet];
+    XCTAssertEqualObjects([hex stringByTrimmingCharactersInSet:invalid], hex);
+    XCTAssertEqualObjects(identifier, [self.cacheManager identifierForURL:url cacheKey:@"song-1"]);
+    XCTAssertNotEqualObjects(identifier, [self.cacheManager identifierForURL:url cacheKey:@"song-2"]);
+    NSString *expectedHex = [self sha256HexForString:@"song-1"];
+    XCTAssertEqualObjects(identifier, [@"sha256-" stringByAppendingString:expectedHex]);
+    NSString *legacyURLHex = [self sha256HexForString:url.absoluteString];
+    XCTAssertEqualObjects([self.cacheManager identifierForURL:url cacheKey:nil], [@"sha256-" stringByAppendingString:legacyURLHex]);
+}
+
+- (void)testLegacyCompleteCacheRemainsPlayableBySongIDAfterMigration {
+    NSString *songID = NSUUID.UUID.UUIDString;
+    NSString *legacyIdentifier = @"legacy-md5-identifier";
+    NSData *audio = [@"legacy-complete-audio" dataUsingEncoding:NSUTF8StringEncoding];
+    NSString *rangesJSON = [NSString stringWithFormat:@"[{\"loc\":0,\"len\":%lu}]", (unsigned long)audio.length];
+    [self installLegacyCacheDatabaseWithSongID:songID
+                               cacheIdentifier:legacyIdentifier
+                                         audio:audio
+                                   totalLength:(long long)audio.length
+                               cachedRangesJSON:rangesJSON
+                                     isFinished:YES];
+
+    NSString *audioPath = [[self.legacyTestDirectory stringByAppendingPathComponent:@"AudioCache"] stringByAppendingPathComponent:[legacyIdentifier stringByAppendingString:@".mp3"]];
+    NSURL *url = [self uniqueURL];
+    NSString *identity = [self.cacheManager cacheIdentityForURL:url cacheKey:songID];
+    NSString *newIdentifier = [self.cacheManager identifierForURL:url cacheKey:identity];
+    XCTAssertTrue([self.cacheManager isFullyCachedForURL:nil cacheKey:songID]);
+    XCTAssertEqualObjects([self.cacheManager cacheFilePathForURL:nil cacheKey:songID], audioPath);
+    XCTAssertEqualObjects([NSData dataWithContentsOfFile:audioPath], audio);
+    XCTAssertFalse([[NSFileManager defaultManager] fileExistsAtPath:[[audioPath stringByDeletingLastPathComponent] stringByAppendingPathComponent:[newIdentifier stringByAppendingString:@".mp3"]]]);
+
+    NSArray<NLAudioCacheInfo *> *rows = [self.legacyTestDatabaseManager.database getObjectsOfClass:NLAudioCacheInfo.class fromTable:NLAudioCacheInfoTableName];
+    NLAudioCacheInfo *persisted = nil;
+    for (NLAudioCacheInfo *candidate in rows) {
+        if ([candidate.cacheIdentifier isEqualToString:legacyIdentifier]) persisted = candidate;
+    }
+    XCTAssertNotNil(persisted);
+    XCTAssertEqualObjects(persisted.songId, songID);
+    XCTAssertEqualObjects(persisted.cachedRangesString, rangesJSON);
+    XCTAssertEqual(persisted.lastAccessTime, 1234);
+    XCTAssertTrue(persisted.isFinished);
+    XCTAssertEqual(persisted.totalLength, (long long)audio.length);
+    [self assertLegacyCacheTableWasRemoved];
+}
+
+- (void)testLegacyPartialRangeIsNotMergedIntoDifferentVariant {
+    NSString *songID = NSUUID.UUID.UUIDString;
+    NSData *audio = [@"legacy-partial-audio" dataUsingEncoding:NSUTF8StringEncoding];
+    NSString *legacyIdentifier = @"legacy-partial-identifier";
+    long long totalLength = (long long)audio.length + 10;
+    NSString *rangesJSON = [NSString stringWithFormat:@"[{\"loc\":0,\"len\":%lu}]", (unsigned long)audio.length];
+    [self installLegacyCacheDatabaseWithSongID:songID
+                               cacheIdentifier:legacyIdentifier
+                                         audio:audio
+                                   totalLength:totalLength
+                               cachedRangesJSON:rangesJSON
+                                     isFinished:NO];
+
+    NSURL *losslessURL = [NSURL URLWithString:@"https://cdn.example.com/audio/lossless.mp3"];
+    NSString *losslessIdentity = [self.cacheManager cacheIdentityForURL:losslessURL cacheKey:songID];
+    NSString *legacyPath = [[self.legacyTestDirectory stringByAppendingPathComponent:@"AudioCache"] stringByAppendingPathComponent:[legacyIdentifier stringByAppendingString:@".tmp"]];
+    XCTAssertEqual([self.cacheManager cachedRangesForURL:losslessURL cacheKey:losslessIdentity].count, 0u);
+    XCTAssertEqual([self.cacheManager totalLengthForURL:losslessURL cacheKey:losslessIdentity], 0);
+    XCTAssertFalse([self.cacheManager isFullyCachedForURL:losslessURL cacheKey:losslessIdentity]);
+    XCTAssertNotEqualObjects([self.cacheManager tempFilePathForURL:losslessURL cacheKey:losslessIdentity], legacyPath);
+    XCTAssertEqualObjects([NSData dataWithContentsOfFile:legacyPath], audio);
+
+    NSArray<NLAudioCacheInfo *> *rows = [self.legacyTestDatabaseManager.database getObjectsOfClass:NLAudioCacheInfo.class fromTable:NLAudioCacheInfoTableName];
+    NLAudioCacheInfo *persisted = nil;
+    for (NLAudioCacheInfo *candidate in rows) {
+        if ([candidate.cacheIdentifier isEqualToString:legacyIdentifier]) persisted = candidate;
+    }
+    XCTAssertNotNil(persisted);
+    XCTAssertEqual(persisted.totalLength, totalLength);
+    XCTAssertEqualObjects(persisted.cachedRangesString, rangesJSON);
+    XCTAssertFalse(persisted.isFinished);
+    [self assertLegacyCacheTableWasRemoved];
 }
 @end

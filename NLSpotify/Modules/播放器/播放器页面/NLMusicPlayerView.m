@@ -543,7 +543,13 @@
     UIImageSymbolConfiguration *config = [UIImageSymbolConfiguration configurationWithPointSize:26 weight:UIImageSymbolWeightLight];
     [button setImage:[UIImage systemImageNamed:iconName withConfiguration:config] forState:UIControlStateNormal];
     button.tintColor = [UIColor labelColor];
-    button.adjustsImageWhenHighlighted = NO;
+    button.configurationUpdateHandler = ^(__kindof UIButton *updatedButton) {
+        if (updatedButton.isHighlighted) {
+            updatedButton.imageView.alpha = 0.5;
+        } else {
+            updatedButton.imageView.alpha = 1.0;
+        }
+    };
     [button addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
     return button;
 }

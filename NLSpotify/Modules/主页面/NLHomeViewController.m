@@ -19,6 +19,7 @@
 #import "NLLoginViewController.h"
 #import "NLAuthManager.h"
 #import "NLCacheManager.h"
+#import "NLPlayerManager.h"
 #import "NLDownloadManager.h"
 #import "NLDownloadRepository.h"
 #import "NLSongRepository.h"
@@ -144,7 +145,6 @@
     } else {
         [self.collapsedSections removeObject:key];
     }
-    NSIndexPath *indexPath = [NSIndexPath indexPathForRow:0 inSection:section];
     [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:section] withRowAnimation:UITableViewRowAnimationFade];
 
     // 折叠最后一个 section 时，contentSize 变小，系统会调整 contentOffset 导致列表整体上移；这里在布局完成后把列表顶在底部留 140pt 间距，避免“向上滑一段”
@@ -229,7 +229,6 @@ viewForFooterInSection:(NSInteger)section {
         return;
     }
     if (index == 5) {
-        __weak typeof(self) w = self;
         [controller dismissWithAnimation:YES completion:^{
             [self showClearAllConfirmation];
         }];
@@ -249,7 +248,15 @@ viewForFooterInSection:(NSInteger)section {
                 UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:loginVC];
                 nav.navigationBarHidden = YES;
 
-                UIWindow *window = s.view.window ?: [UIApplication sharedApplication].windows.firstObject;
+                UIWindow *window = s.view.window;
+                if (!window) {
+                    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+                        if (scene.activationState == UISceneActivationStateForegroundActive && [scene isKindOfClass:UIWindowScene.class]) {
+                            window = ((UIWindowScene *)scene).windows.firstObject;
+                            break;
+                        }
+                    }
+                }
                 if (!window) return;
                 window.rootViewController = nav;
             }]];
@@ -267,10 +274,29 @@ viewForFooterInSection:(NSInteger)section {
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     __weak typeof(self) w = self;
     [alert addAction:[UIAlertAction actionWithTitle:@"清空" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
-        [[NLDownloadManager sharedManager] cancelAllDownloads];
-        [NLDownloadRepository clearAllDownloadItems];
-        [NLSongRepository clearAllDownloadedSongs];
+        [[NLPlayerManager sharedManager] stop];
+        [[NLDownloadManager sharedManager] removeAllOfflineDownloads];
         [[NLCacheManager sharedManager] clearAllCache];
+        [NLDownloadRepository clearAllDownloadItemsWithCompletion:^(BOOL queueCleared) {
+            __strong typeof(w) self = w;
+            if (!self || queueCleared) {
+                if (!self) return;
+                [NLSongRepository clearAllDownloadedSongsWithCompletion:^(BOOL songsCleared) {
+                    if (songsCleared) return;
+                    UIAlertController *failure = [UIAlertController alertControllerWithTitle:@"清空失败"
+                                                                                       message:@"已下载歌曲记录未能全部清除，请重试。"
+                                                                                preferredStyle:UIAlertControllerStyleAlert];
+                    [failure addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+                    [self presentViewController:failure animated:YES completion:nil];
+                }];
+                return;
+            }
+            UIAlertController *failure = [UIAlertController alertControllerWithTitle:@"清空失败"
+                                                                               message:@"下载队列未能清除，请重试。"
+                                                                        preferredStyle:UIAlertControllerStyleAlert];
+            [failure addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:failure animated:YES completion:nil];
+        }];
     }]];
     [w presentViewController:alert animated:YES completion:nil];
 }

@@ -92,7 +92,7 @@
 }
 
 - (void)setupConstrains {
-    CGFloat coverSide = [UIScreen mainScreen].bounds.size.width - 120;
+    CGFloat coverSide = (self.bounds.size.width > 0 ? self.bounds.size.width : self.window.windowScene.screen.bounds.size.width) - 120;
     if (coverSide > 240) coverSide = 240;
     // TableView 已用 contentInsetAdjustmentBehavior = Automatic，系统已预留导航栏下方空间，这里只保留封面距 header 顶部的间距
     CGFloat topInset = 24.0;
@@ -276,7 +276,7 @@
         return;
     }
     
-    CGFloat width = [UIScreen mainScreen].bounds.size.width - 48;
+    CGFloat width = (self.bounds.size.width > 0 ? self.bounds.size.width : self.window.windowScene.screen.bounds.size.width) - 48;
     CGFloat lineHeight = _descLabel.font.lineHeight;
     CGFloat threeLineHeight = lineHeight * 3 + 4;
     CGSize maxSize = CGSizeMake(width, CGFLOAT_MAX);

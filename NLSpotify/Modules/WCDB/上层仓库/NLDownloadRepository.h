@@ -11,37 +11,30 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface NLDownloadRepository : NSObject
 
-/// 安全地创建下载表（如不存在则创建）。
-+ (void)safeCreateTable;
-
-/// 查询所有下载记录，按 addedTime 从新到旧排序。
-/// - Returns: 下载项数组。
+/// 查询所有下载记录，按 addedTime 从新到旧排序。调用方须在后台读取。
 + (NSArray<NLDownloadItem *> *)allDownloadItems;
 
-/// 根据歌曲 ID 查询对应的下载记录。
-/// - Parameter songId: 歌曲唯一标识。
-/// - Returns: 若存在则为对应的下载项，否则为 `nil`。
+/// 根据歌曲 ID 查询对应的下载记录。调用方须在后台读取。
 + (nullable NLDownloadItem *)downloadItemForSongId:(NSString *)songId;
 
 /// 新增一条下载记录。
-/// - Parameters:
-///   - song: 关联的歌曲模型。
-///   - status: 初始下载状态。
-/// - Returns: 插入是否成功。
-+ (BOOL)addDownloadItemWithSong:(NLSong *)song status:(NSString *)status;
++ (void)addDownloadItemWithSong:(NLSong *)song
+                         status:(NSString *)status
+                     completion:(void (^)(BOOL success))completion;
+
 /// 更新指定歌曲的下载状态。
-/// - Parameters:
-///   - status: 新的状态字符串。
-///   - songId: 歌曲唯一标识。
-/// - Returns: 更新是否成功。
-+ (BOOL)updateStatus:(NSString *)status forSongId:(NSString *)songId;
++ (void)updateStatus:(NSString *)status
+           forSongId:(NSString *)songId
+          completion:(void (^)(BOOL success))completion;
+
+/// 在一个 WCDB 事务中提交下载完成状态和已下载歌曲记录。
++ (void)completeDownloadWithSong:(NLSong *)song completion:(void (^)(BOOL success))completion;
 
 /// 删除指定歌曲的下载记录。
-/// - Parameter songId: 歌曲唯一标识。
-/// - Returns: 删除是否成功。
-+ (BOOL)removeDownloadItemWithSongId:(NSString *)songId;
++ (void)removeDownloadItemWithSongId:(NSString *)songId completion:(void (^)(BOOL success))completion;
+
 /// 清空所有下载记录。
-+ (void)clearAllDownloadItems;
++ (void)clearAllDownloadItemsWithCompletion:(void (^)(BOOL success))completion;
 
 @end
 

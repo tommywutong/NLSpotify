@@ -8,32 +8,48 @@
 #import "NLGuestLoginService.h"
 #import "NetWorkManager.h"
 
+static NSError *NLGuestLoginError(NSInteger code, NSString *message) {
+    return [NSError errorWithDomain:@"NLGuestLoginService"
+                               code:code
+                           userInfo:@{NSLocalizedDescriptionKey: message}];
+}
+
 @implementation NLGuestLoginService
+
++ (NSString *)cookieFromResponse:(id)response error:(NSError **)error {
+    if (error) *error = nil;
+    if (![response isKindOfClass:NSDictionary.class]) {
+        if (error) *error = NLGuestLoginError(-1, @"游客登录响应格式错误");
+        return nil;
+    }
+
+    NSDictionary *dictionary = response;
+    NSInteger code = [dictionary[@"code"] integerValue];
+    if (code != 200) {
+        NSString *message = [dictionary[@"message"] isKindOfClass:NSString.class] ? dictionary[@"message"] : @"游客登录失败";
+        if (error) *error = NLGuestLoginError(code, message);
+        return nil;
+    }
+
+    id value = dictionary[@"cookie"];
+    if (![value isKindOfClass:NSString.class] || [value length] == 0) {
+        if (error) *error = NLGuestLoginError(-2, @"游客登录响应缺少 Cookie");
+        return nil;
+    }
+    return value;
+}
 
 + (void)anonymousLoginWithSuccess:(void(^)(NSDictionary *))success
                           failure:(void(^)(NSError *))failure {
-    NSString *path = @"/register/anonimous";
-    [[NetWorkManager sharedManager] GET:path parameters:nil success:^(id responseObject) {
-        if ([responseObject isKindOfClass:[NSDictionary class]]) {
-            NSDictionary *response = responseObject;
-            NSInteger code = [response[@"code"] integerValue];
-            if (code == 200) {
-                NSString *cookie = response[@"cookie"];
-                // NSLog(@"[NLGuestLoginService] 接口成功 code=200，取到 cookie: %@，长度=%lu", cookie.length > 0 ? @"是" : @"否", (unsigned long)(cookie.length)); // 专注播放器时先注释
-                if (success) success(response);
-            } else {
-                NSString *errorMsg = response[@"message"] ?: @"游客登录失败";
-                NSError *error = [NSError errorWithDomain:@"NLGuestLoginService"
-                                                     code:code
-                                                 userInfo:@{NSLocalizedDescriptionKey: errorMsg}];
-                if (failure) failure(error);
-            }
-        } else {
-            NSError *error = [NSError errorWithDomain:@"NLGuestLoginService"
-                                                 code:-1
-                                             userInfo:@{NSLocalizedDescriptionKey: @"数据格式错误"}];
+    [[NetWorkManager sharedManager] GET:@"/register/anonimous"
+                             parameters:@{}
+                                success:^(id responseObject) {
+        NSError *error = nil;
+        if (![self cookieFromResponse:responseObject error:&error]) {
             if (failure) failure(error);
+            return;
         }
+        if (success) success(responseObject);
     } failure:^(NSError *error) {
         if (failure) failure(error);
     }];

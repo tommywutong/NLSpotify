@@ -10,7 +10,7 @@
 NS_ASSUME_NONNULL_BEGIN
 
 @interface NLAudioCacheInfo : NSObject
-@property (nonatomic, copy) NSString *urlMD5;
+@property (nonatomic, copy) NSString *cacheIdentifier;
 @property (nonatomic, copy, nullable) NSString *songId;
 @property (nonatomic, assign) long long totalLength;
 

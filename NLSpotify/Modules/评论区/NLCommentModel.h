@@ -22,16 +22,6 @@ NS_ASSUME_NONNULL_BEGIN
 
 
 @property (nonatomic, assign) BOOL isExpanded;
-@property (nonatomic, assign) BOOL needExpand;
-
-// 文本缓存、
-@property (nonatomic, copy, nullable) NSAttributedString *collapsedAttr;
-@property (nonatomic, copy, nullable) NSAttributedString *expandedAttr;
-@property (nonatomic, copy, nullable) NSAttributedString *displayText;
-
-// 高度缓存
-@property (nonatomic, assign) CGFloat collapsedHeight;
-@property (nonatomic, assign) CGFloat expandedHeight;
 
 @property (nonatomic, assign) NSInteger replyCount;
 @property (nonatomic, copy) NSArray<NLCommentModel *> *beReplied;

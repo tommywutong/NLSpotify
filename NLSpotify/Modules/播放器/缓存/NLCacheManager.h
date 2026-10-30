@@ -8,6 +8,8 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+/// Writes/promotion trigger L2/L3 cleanup at 128/500 MiB, trimming the affected tier to 90%.
+/// Protected files may keep a tier above its target. Startup only reconciles and measures files.
 @interface NLCacheManager : NSObject
 
 + (instancetype)sharedManager;
@@ -78,9 +80,7 @@ extern NSNotificationName const NLCacheManagerDidFinishCachingNotification;
 
 #pragma mark - Cleanup
 
-- (void)cleanPartialCacheWithMaxSize:(long long)maxSize;
-- (void)cleanCompletedCacheWithMaxSize:(long long)maxSize;
-- (void)cleanCacheWithMaxSize:(long long)maxSize;
+/// Explicitly clear ordinary disk/memory caches and their ledger, preserving offline downloads.
 - (void)clearAllCache;
 
 @end

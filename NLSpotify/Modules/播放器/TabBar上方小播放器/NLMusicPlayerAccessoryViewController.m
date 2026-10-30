@@ -36,28 +36,6 @@
     }];
 }
 
-//- (void)playSongWithId:(NSString *)songId
-//                 title:(NSString *)title
-//                artist:(NSString *)artist
-//              coverURL:(nullable NSString *)coverURL {
-//
-//
-//  NLSong *song = [[NLSong alloc] initWithId:songId
-//                                      title:title
-//                                     artist:artist
-//                                   coverURL:coverURL];
-//
-//
-//[[NLSongService sharedService] fetchPlayableURLWithSongId:songId success:^(NSURL *playURL) {
-//  song.playURL = playURL;
-//  dispatch_async(dispatch_get_main_queue(), ^{
-//    [[NLPlayerManager sharedManager] playWithSong:song];
-//  });
-//  } failure:^(NSError *error) {
-//      NSLog(@"获取音乐 URL 失败: %@", error.localizedDescription);
-//  }];
-//}
-
 #pragma mark - NLMusicPlayerAccessoryViewDelegate
 // present只能在当前
 

@@ -19,6 +19,9 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, assign) NSTimeInterval addedTime;
 
 @property (nonatomic, copy) NSString *status;
+/// 瞬时进度快照，仅由下载管理器填充，不映射到 WCDB。
+@property (nonatomic, assign) long long receivedBytes;
+@property (nonatomic, assign) long long expectedBytes;
 
 - (NSURL * _Nullable)playURL;
 

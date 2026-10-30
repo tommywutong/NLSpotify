@@ -39,6 +39,8 @@ NS_ASSUME_NONNULL_BEGIN
 /// 当前播放状态。
 /// - SeeAlso: `NLPlaybackState`
 @property (nonatomic, assign, readonly) NLPlaybackState playbackState;
+/// 用户是否希望播放；等待数据或被系统中断时，可能为 YES 而引擎并未播放。
+@property (nonatomic, assign, readonly) BOOL wantsToPlay;
 /// 当前播放列表。
 /// - Discussion: 顺序与 UI 中列表顺序一致。
 @property (nonatomic, strong, readonly) NSArray<NLSong *> *playlist;
@@ -99,7 +101,7 @@ NS_ASSUME_NONNULL_BEGIN
 /// 跳转到指定进度位置。
 /// - Parameter progress: 0.0 ~ 1.0 的进度值。
 - (void)seekToProgress:(float)progress;
-/// 配置音频 Session（后台播放、打断恢复等）。
+/// 在串行后台队列配置并激活音频 Session；结果回主线程校验，避免阻塞 UI。
 - (void)setupAudioSession;
 /// 配置系统远程控制命令（耳机线控、锁屏控制中心等）。
 - (void)setupRemoteCommands;

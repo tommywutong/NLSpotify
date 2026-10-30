@@ -17,14 +17,7 @@
 @property (nonatomic, strong) UIImageView *logoImageView;
 @property (nonatomic, strong) UILabel *titleLabel;
 @property (nonatomic, strong) UIView *buttonsContainer;
-@property (nonatomic, strong) UIButton *emailButton;
-@property (nonatomic, strong) UIButton *facebookButton;
-@property (nonatomic, strong) UIButton *phoneButton;
-@property (nonatomic, strong) UIButton *googleButton;
-@property (nonatomic, strong) UIButton *appleButton;
 @property (nonatomic, strong) UIButton *guestLoginButton;
-@property (nonatomic, strong) UILabel *registerHintLabel;
-@property (nonatomic, strong) UIButton *registerButton;
 
 @end
 
@@ -40,8 +33,6 @@
     [self.view addSubview:self.logoImageView];
     [self.view addSubview:self.titleLabel];
     [self.view addSubview:self.buttonsContainer];
-    [self.view addSubview:self.registerHintLabel];
-    [self.view addSubview:self.registerButton];
 
     [self setupConstraints];
 }
@@ -63,31 +54,10 @@
         make.left.right.equalTo(self.view).inset(20);
     }];
 
-    NSArray *buttons = @[self.emailButton, self.phoneButton, self.facebookButton, self.googleButton, self.appleButton, self.guestLoginButton];
-    UIButton *previousButton = nil;
-    for (UIButton *button in buttons) {
-        [button mas_makeConstraints:^(MASConstraintMaker *make) {
-            make.left.right.equalTo(self.buttonsContainer);
-            make.height.mas_equalTo(50);
-            if (previousButton) {
-                make.top.equalTo(previousButton.mas_bottom).offset(12);
-            } else {
-                make.top.equalTo(self.buttonsContainer);
-            }
-        }];
-        previousButton = button;
-    }
-    [previousButton mas_makeConstraints:^(MASConstraintMaker *make) {
-        make.bottom.equalTo(self.buttonsContainer);
-    }];
-
-    [self.registerHintLabel mas_makeConstraints:^(MASConstraintMaker *make) {
-        make.centerX.equalTo(self.view).offset(-20);
-        make.bottom.equalTo(self.view.mas_safeAreaLayoutGuideBottom).offset(-20);
-    }];
-    [self.registerButton mas_makeConstraints:^(MASConstraintMaker *make) {
-        make.centerY.equalTo(self.registerHintLabel);
-        make.left.equalTo(self.registerHintLabel.mas_right).offset(4);
+    [self.guestLoginButton mas_makeConstraints:^(MASConstraintMaker *make) {
+        make.left.right.equalTo(self.buttonsContainer);
+        make.top.bottom.equalTo(self.buttonsContainer);
+        make.height.mas_equalTo(50);
     }];
 }
 
@@ -118,10 +88,10 @@
             make.centerY.equalTo(button);
             make.width.height.mas_equalTo(24);
         }];
-        button.titleEdgeInsets = UIEdgeInsetsMake(0, 8, 0, 0);
+        button.configuration.contentInsets = NSDirectionalEdgeInsetsMake(0, 8, 0, 0);
     } else {
         // 没有图标，居中显示标题
-        button.titleEdgeInsets = UIEdgeInsetsZero;
+        button.configuration.contentInsets = NSDirectionalEdgeInsetsZero;
     }
 
     return button;
@@ -131,68 +101,30 @@
 
 #pragma mark - Button Actions
 
-- (void)backButtonTapped {
-    [self dismissViewControllerAnimated:YES completion:nil];
-}
-
-- (void)phoneLoginTapped {
-    NSLog(@"手机号登录");
-    [self showLoginAlert];
-}
-
-- (void)emailLoginTapped {
-    NSLog(@"电子邮件登录");
-    [self showLoginAlert];
-}
-
-- (void)facebookLoginTapped {
-    NSLog(@"Facebook登录");
-    [self showLoginAlert];
-}
-
-- (void)googleLoginTapped {
-    NSLog(@"Google登录");
-    [self showLoginAlert];
-}
-
-- (void)appleLoginTapped {
-    NSLog(@"Apple登录");
-    [self showLoginAlert];
-}
-
-- (void)registerButtonTapped {
-    NSLog(@"注册按钮点击");
-    [self showLoginAlert];
-}
-
 - (void)guestLoginTapped {
     __weak typeof(self) weakSelf = self;
     [NLGuestLoginService anonymousLoginWithSuccess:^(NSDictionary *response) {
-        NSString *cookie = response[@"cookie"];
-        if (cookie.length > 0) {
-            NSLog(@"[测试] 请求到新 cookie（游客登录），长度=%lu", (unsigned long)cookie.length);
-            [NLAuthManager setCookie:cookie];
-        } else {
-            NSLog(@"[测试] 游客登录成功但响应中无 cookie，code=%@", response[@"code"] ?: @"");
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self) return;
+
+        NSError *error = nil;
+        NSString *cookie = [NLGuestLoginService cookieFromResponse:response error:&error];
+        if (!cookie || ![NLAuthManager setCookie:cookie error:&error]) {
+            [self presentGuestLoginFailure:error];
+            return;
         }
         [NLAuthManager setLoginStateWithAccount:response[@"account"]];
-        [weakSelf loginSuccess];
+        [self loginSuccess];
     } failure:^(NSError *error) {
-        NSLog(@"[游客登录] 失败，未取到 cookie，错误: %@", error.localizedDescription);
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"游客登录失败"
-                                                                       message:error.localizedDescription
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleCancel handler:nil]];
-        [weakSelf presentViewController:alert animated:YES completion:nil];
+        [weakSelf presentGuestLoginFailure:error];
     }];
 }
 
-- (void)showLoginAlert {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"                           错误"
-                                                                   message:@"当前不支持该方式登录"
+- (void)presentGuestLoginFailure:(NSError *)error {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"游客登录失败"
+                                                                   message:error.localizedDescription ?: @"凭据保存失败"
                                                             preferredStyle:UIAlertControllerStyleAlert];
-    UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
-    [alert addAction:cancelAction];
+    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
@@ -204,7 +136,16 @@
     transition.duration = 0.5;
     transition.type = kCATransitionFade;
 
-    UIWindow *window = [UIApplication sharedApplication].windows.firstObject;
+    UIWindow *window = self.view.window;
+    if (!window) {
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if (scene.activationState == UISceneActivationStateForegroundActive && [scene isKindOfClass:UIWindowScene.class]) {
+                window = ((UIWindowScene *)scene).windows.firstObject;
+                break;
+            }
+        }
+    }
+    if (!window) return;
     [window.layer addAnimation:transition forKey:kCATransition];
     window.rootViewController = tabBarController;
 }
@@ -244,55 +185,11 @@
 - (UIView *)buttonsContainer {
     if (!_buttonsContainer) {
         _buttonsContainer = [[UIView alloc] init];
-        [_buttonsContainer addSubview:self.emailButton];
-        [_buttonsContainer addSubview:self.phoneButton];
-        [_buttonsContainer addSubview:self.facebookButton];
-        [_buttonsContainer addSubview:self.googleButton];
-        [_buttonsContainer addSubview:self.appleButton];
         [_buttonsContainer addSubview:self.guestLoginButton];
     }
     return _buttonsContainer;
 }
 
-- (UIButton *)phoneButton {
-    if (!_phoneButton) {
-        _phoneButton = [self createLoginButtonWithTitle:@"手机号登录" backgroundColor:[UIColor secondarySystemBackgroundColor] textColor:[UIColor labelColor] icon:@"phone.fill"];
-        [_phoneButton addTarget:self action:@selector(phoneLoginTapped) forControlEvents:UIControlEventTouchUpInside];
-    }
-    return _phoneButton;
-}
-
-- (UIButton *)emailButton {
-    if (!_emailButton) {
-        _emailButton = [self createLoginButtonWithTitle:@"使用电子邮件继续" backgroundColor:[UIColor systemGreenColor] textColor:[UIColor labelColor] icon:nil];
-        [_emailButton addTarget:self action:@selector(emailLoginTapped) forControlEvents:UIControlEventTouchUpInside];
-    }
-    return _emailButton;
-}
-
-- (UIButton *)facebookButton {
-    if (!_facebookButton) {
-        _facebookButton = [self createLoginButtonWithTitle:@"使用Facebook帐号继续" backgroundColor:[UIColor secondarySystemBackgroundColor] textColor:[UIColor labelColor] icon:@"f.circle.fill"];
-        [_facebookButton addTarget:self action:@selector(facebookLoginTapped) forControlEvents:UIControlEventTouchUpInside];
-    }
-    return _facebookButton;
-}
-
-- (UIButton *)googleButton {
-    if (!_googleButton) {
-        _googleButton = [self createLoginButtonWithTitle:@"使用Google帐号继续" backgroundColor:[UIColor secondarySystemBackgroundColor] textColor:[UIColor labelColor] icon:@"g.circle.fill"];
-        [_googleButton addTarget:self action:@selector(googleLoginTapped) forControlEvents:UIControlEventTouchUpInside];
-    }
-    return _googleButton;
-}
-
-- (UIButton *)appleButton {
-    if (!_appleButton) {
-        _appleButton = [self createLoginButtonWithTitle:@"使用Apple帐号继续" backgroundColor:[UIColor secondarySystemBackgroundColor] textColor:[UIColor labelColor] icon:@"apple.logo"];
-        [_appleButton addTarget:self action:@selector(appleLoginTapped) forControlEvents:UIControlEventTouchUpInside];
-    }
-    return _appleButton;
-}
 
 - (UIButton *)guestLoginButton {
     if (!_guestLoginButton) {
@@ -302,26 +199,6 @@
     return _guestLoginButton;
 }
 
-- (UILabel *)registerHintLabel {
-    if (!_registerHintLabel) {
-        _registerHintLabel = [[UILabel alloc] init];
-        _registerHintLabel.text = @"尚未拥有帐号？";
-        _registerHintLabel.font = [UIFont systemFontOfSize:14];
-        _registerHintLabel.textColor = [UIColor tertiaryLabelColor];
-    }
-    return _registerHintLabel;
-}
-
-- (UIButton *)registerButton {
-    if (!_registerButton) {
-        _registerButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        [_registerButton setTitle:@"注册" forState:UIControlStateNormal];
-        [_registerButton setTitleColor:[UIColor systemGreenColor] forState:UIControlStateNormal];
-        _registerButton.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
-        [_registerButton addTarget:self action:@selector(registerButtonTapped) forControlEvents:UIControlEventTouchUpInside];
-    }
-    return _registerButton;
-}
 
 @end
 

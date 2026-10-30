@@ -69,6 +69,8 @@ static const CGFloat kPlaylistCoverSize = 40.0;
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, copy) NSArray<NLPlayList *> *playlists;
 @property (nonatomic, strong) MASConstraint *containerBottomConstraint;
+@property (nonatomic, copy) NSDictionary<NSString *, NSNumber *> *songCountsByPlaylistID;
+@property (nonatomic, assign) NSUInteger playlistLoadToken;
 @end
 
 @implementation NLAddToPlaylistSheetViewController
@@ -119,7 +121,7 @@ static const CGFloat kPlaylistCoverSize = 40.0;
         make.edges.equalTo(self.view);
     }];
 
-    CGFloat sheetHeight = [UIScreen mainScreen].bounds.size.height * 0.5;
+    CGFloat sheetHeight = self.view.bounds.size.height * 0.5;
     [_containerView mas_makeConstraints:^(MASConstraintMaker *make) {
         make.left.right.equalTo(self.view);
         make.height.mas_equalTo(sheetHeight);
@@ -148,8 +150,22 @@ static const CGFloat kPlaylistCoverSize = 40.0;
 }
 
 - (void)loadPlaylists {
-    self.playlists = [NLPlayListRepository allUserCreatedPlayLists];
-    [self.tableView reloadData];
+    NSUInteger token = ++self.playlistLoadToken;
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSArray<NLPlayList *> *playlists = [NLPlayListRepository allUserCreatedPlayLists];
+        NSMutableDictionary<NSString *, NSNumber *> *counts = [NSMutableDictionary dictionaryWithCapacity:playlists.count];
+        for (NLPlayList *playlist in playlists) {
+            counts[playlist.playlistId] = @([NLPlayListRepository songsInPlayList:playlist.playlistId].count);
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self || token != self.playlistLoadToken) return;
+            self.playlists = playlists;
+            self.songCountsByPlaylistID = counts;
+            [self.tableView reloadData];
+        });
+    });
 }
 
 - (void)dismissSelf {
@@ -191,7 +207,7 @@ static const CGFloat kPlaylistCoverSize = 40.0;
     cell.backgroundColor = [UIColor systemBackgroundColor];
     NLPlayList *pl = self.playlists[indexPath.row - 1];
     cell.nameLabel.text = pl.name.length ? pl.name : @"歌单";
-    NSInteger count = (NSInteger)[NLPlayListRepository songsInPlayList:pl.playlistId].count;
+    NSInteger count = self.songCountsByPlaylistID[pl.playlistId].integerValue;
     cell.countLabel.text = count == 0 ? @"0首" : [NSString stringWithFormat:@"%ld首", (long)count];
     if (pl.coverURL.length > 0) {
         [cell.coverImageView sd_setImageWithURL:[NSURL URLWithString:pl.coverURL] placeholderImage:nil];
@@ -211,25 +227,35 @@ static const CGFloat kPlaylistCoverSize = 40.0;
         vc.titleText = @"新建歌单";
         vc.placeholder = @"输入歌单名称";
         vc.confirmButtonTitle = @"创建并添加";
-        __weak typeof(self) w = self;
+        __weak typeof(self) weakSelf = self;
         vc.completion = ^(NSString *name) {
-            __strong typeof(w) self = w;
+            __strong typeof(weakSelf) self = weakSelf;
             if (!self) return;
-            NLPlayList *pl = [NLPlayListRepository createUserPlayListWithName:name];
-            if (pl) {
-                [NLPlayListRepository addSong:self.currentSong toPlayList:pl.playlistId];
-                [self loadPlaylists];
-                [self showToast:@"收藏成功"];
-            }
+            [NLPlayListRepository createUserPlayListWithName:name completion:^(NLPlayList * _Nullable playlist) {
+                if (!playlist) {
+                    [self showToast:@"创建失败，请重试"];
+                    return;
+                }
+                [NLPlayListRepository addSong:self.currentSong toPlayList:playlist.playlistId completion:^(BOOL success) {
+                    [self loadPlaylists];
+                    [self showToast:success ? @"收藏成功" : @"添加失败，请重试"];
+                }];
+            }];
         };
         [self presentViewController:vc animated:YES completion:nil];
         return;
     }
 
-    NLPlayList *pl = self.playlists[indexPath.row - 1];
-    [NLPlayListRepository addSong:self.currentSong toPlayList:pl.playlistId];
-    [self showToast:@"收藏成功"];
-    [self dismissSelf];
+    if (indexPath.row - 1 >= self.playlists.count) return;
+    NLPlayList *playlist = self.playlists[indexPath.row - 1];
+    [NLPlayListRepository addSong:self.currentSong toPlayList:playlist.playlistId completion:^(BOOL success) {
+        if (!success) {
+            [self showToast:@"添加失败，请重试"];
+            return;
+        }
+        [self showToast:@"收藏成功"];
+        [self dismissSelf];
+    }];
 }
 
 - (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {

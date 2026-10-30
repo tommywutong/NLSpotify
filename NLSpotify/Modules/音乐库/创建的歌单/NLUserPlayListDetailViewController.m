@@ -9,7 +9,6 @@
 #import "NLSong.h"
 #import "NLSongListCell.h"
 #import "NLPlayerManager.h"
-#import "NLSongService.h"
 #import "NLLikedSongsPickerViewController.h"
 #import <Masonry/Masonry.h>
 
@@ -20,6 +19,7 @@ static NSString * const kUserPlayListSongCellId = @"UserPlayListSongCell";
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) UIView *emptyStateView;
 @property (nonatomic, copy) NSArray<NLSong *> *songs;
+@property (nonatomic, assign) NSUInteger dataLoadToken;
 @end
 
 @implementation NLUserPlayListDetailViewController
@@ -77,13 +77,19 @@ static NSString * const kUserPlayListSongCellId = @"UserPlayListSongCell";
 }
 
 - (void)loadData {
-    if (!self.playlist.playlistId.length) {
-        self.songs = @[];
-    } else {
-        self.songs = [NLPlayListRepository songsInPlayList:self.playlist.playlistId];
-    }
-    [self.tableView reloadData];
-    self.emptyStateView.hidden = self.songs.count > 0;
+    NSUInteger token = ++self.dataLoadToken;
+    NSString *playlistID = [self.playlist.playlistId copy];
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSArray<NLSong *> *songs = playlistID.length ? [NLPlayListRepository songsInPlayList:playlistID] : @[];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self || token != self.dataLoadToken) return;
+            self.songs = songs;
+            [self.tableView reloadData];
+            self.emptyStateView.hidden = self.songs.count > 0;
+        });
+    });
 }
 
 #pragma mark - UITableViewDataSource / Delegate
@@ -102,23 +108,9 @@ static NSString * const kUserPlayListSongCellId = @"UserPlayListSongCell";
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     NLSong *song = self.songs[indexPath.row];
     if (!song.songId.length) return;
-
     NSMutableArray<NLSong *> *list = [self.songs mutableCopy];
     NSInteger startIndex = indexPath.row;
-    __weak typeof(self) weakSelf = self;
-    [[NLSongService sharedService] fetchPlayableURLWithSongId:song.songId
-                                                     success:^(NSURL *playURL) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            __strong typeof(weakSelf) self = weakSelf;
-            if (!self) return;
-            if (startIndex < (NSInteger)list.count) list[startIndex].playURL = playURL;
-            [[NLPlayerManager sharedManager] playWithPlaylist:list startIndex:startIndex];
-        });
-    } failure:^(NSError *error) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            NSLog(@"我的歌单详情: 获取播放链接失败 %@", error.localizedDescription);
-        });
-    }];
+    [[NLPlayerManager sharedManager] playWithPlaylist:list startIndex:startIndex];
 }
 
 - (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {

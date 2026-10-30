@@ -8,7 +8,6 @@
 #import "NLSong.h"
 #import "NLSongListCell.h"
 #import "NLPlayerManager.h"
-#import "NLSongService.h"
 #import <Masonry/Masonry.h>
 
 static NSString * const kCellId = @"RecentPlayCell";
@@ -17,6 +16,7 @@ static NSString * const kCellId = @"RecentPlayCell";
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) UIView *emptyStateView;
 @property (nonatomic, copy) NSArray<NLSong *> *songs;
+@property (nonatomic, assign) NSUInteger historyRequestToken;
 @end
 
 @implementation NLRecentPlayViewController
@@ -59,11 +59,15 @@ static NSString * const kCellId = @"RecentPlayCell";
 }
 
 - (void)loadData {
-    // 最近一次播放排在最上面
-    NSArray<NLSong *> *history = [NLSongRepository allPlayHistory];
-    self.songs = [[[history reverseObjectEnumerator] allObjects] copy];
-    [self.tableView reloadData];
-    self.emptyStateView.hidden = self.songs.count > 0;
+    NSUInteger token = ++self.historyRequestToken;
+    __weak typeof(self) weakSelf = self;
+    [NLSongRepository allPlayHistoryWithCompletion:^(NSArray<NLSong *> *history) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self || token != self.historyRequestToken) return;
+        self.songs = history;
+        [self.tableView reloadData];
+        self.emptyStateView.hidden = history.count > 0;
+    }];
 }
 
 #pragma mark - UITableViewDataSource / Delegate
@@ -85,18 +89,7 @@ static NSString * const kCellId = @"RecentPlayCell";
 
     NSMutableArray<NLSong *> *list = [self.songs mutableCopy];
     NSInteger startIndex = indexPath.row;
-    __weak typeof(self) w = self;
-    [[NLSongService sharedService] fetchPlayableURLWithSongId:song.songId
-                                                     success:^(NSURL *playURL) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (startIndex < (NSInteger)list.count) list[startIndex].playURL = playURL;
-            [[NLPlayerManager sharedManager] playWithPlaylist:list startIndex:startIndex];
-        });
-    } failure:^(NSError *error) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            NSLog(@"最近播放: 获取播放链接失败 %@", error.localizedDescription);
-        });
-    }];
+    [[NLPlayerManager sharedManager] playWithPlaylist:list startIndex:startIndex];
 }
 
 - (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {

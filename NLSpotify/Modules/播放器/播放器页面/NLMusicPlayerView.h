@@ -56,7 +56,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 
 - (void)updateTitle:(NSString *)title artist:(NSString *)artist;
-- (void)updateCoverURL:(NSURL *)url;
+- (void)updateCoverURL:(nullable NSURL *)url;
 - (void)updateProgress:(float)progress;
 - (void)refreshProgress;
 - (void)updateCacheProgress:(float)cacheProgress;

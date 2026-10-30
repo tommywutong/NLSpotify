@@ -42,9 +42,10 @@
 //                   name:NLPlayerPlaybackStateDidChangeNotification object:nil];
     NLPlayerManager *manager = NLPlayerManager.sharedManager;
     @weakify(self);
+    // 单例 Subject 不会 completed。weakify 不断开订阅，视图销毁时用 takeUntil 移除 subscriber。
 
     // 歌曲变化
-    [manager.songSignal subscribeNext:^(NLSong *song) {
+    [[manager.songSignal takeUntil:self.rac_willDeallocSignal] subscribeNext:^(NLSong *song) {
         @strongify(self);
         if (!song) {
             self.titleLabel.text = @"未播放";
@@ -65,9 +66,9 @@
     }];
 
     // 播放状态
-    [manager.playbackStateSignal subscribeNext:^(NSNumber *stateNum) {
+    [[manager.playbackStateSignal takeUntil:self.rac_willDeallocSignal] subscribeNext:^(NSNumber *stateNum) {
         @strongify(self);
-        BOOL playing = stateNum.integerValue == NLPlaybackStatePlaying;
+        BOOL playing = manager.wantsToPlay;
         NSString *icon = playing ? @"pause.fill" : @"play.fill";
         [self.playPauseButton setImage:[UIImage systemImageNamed:icon]
                               forState:UIControlStateNormal];
@@ -212,8 +213,7 @@
 }
 
 - (void)refreshPlayButton {
-    NLPlaybackState state = [NLPlayerManager sharedManager].playbackState;
-    NSString *iconName = (state == NLPlaybackStatePlaying) ? @"pause.fill" : @"play.fill";
+    NSString *iconName = NLPlayerManager.sharedManager.wantsToPlay ? @"pause.fill" : @"play.fill";
     [self.playPauseButton setImage:[UIImage systemImageNamed:iconName]
                           forState:UIControlStateNormal];
 }

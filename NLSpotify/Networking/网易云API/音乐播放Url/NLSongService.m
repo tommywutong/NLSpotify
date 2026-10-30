@@ -13,6 +13,19 @@ static NSString *firstSongIdFromString(NSString *ids) {
     return first.length > 0 ? first : ids;
 }
 
+static NSString *NLSongServiceDescriptionForCode(NSInteger code, NSString *fallbackMessage) {
+    switch (code) {
+        case NLSongServiceResponseBodyInvalid:
+            return @"播放链接响应格式非法";
+        case NLSongServiceResponseMissingPlayableURL:
+            return @"接口未返回可播放链接";
+        case NLSongServicePlayableURLInvalid:
+            return fallbackMessage.length ? fallbackMessage : @"可播放链接无效";
+        default:
+            return fallbackMessage;
+    }
+}
+
 @implementation NLSongService
 
 + (instancetype)sharedService {
@@ -36,33 +49,73 @@ static NSString *firstSongIdFromString(NSString *ids) {
     NSDictionary *params = @{@"id": songId};
 
     [[NetWorkManager sharedManager] GET:@"/song/url" parameters:params success:^(id _Nonnull responseObject) {
-        NSString *playURLString = nil;
         NSString *resolvedId = firstSongIdFromString(songId);
-        NSArray *dataArray = responseObject[@"data"];
-
-        if ([dataArray isKindOfClass:[NSArray class]] && dataArray.count > 0) {
-            id item = dataArray[0];
-            if ([item isKindOfClass:[NSDictionary class]]) {
-                id urlObj = item[@"url"];
-                if ([urlObj isKindOfClass:[NSString class]]) {
-                    playURLString = (NSString *)urlObj;
-                }
-            }
+        NSError *parseError = nil;
+        NSURL *playURL = [NLSongService playableURLFromResponseObject:responseObject error:&parseError];
+        if (!playURL) {
+            NSLog(@"[NLSongService] 播放链接不可用 songId=%@ error=%@", resolvedId, parseError.localizedDescription);
+            if (failure) failure(parseError);
+            return;
         }
 
-        if (playURLString.length == 0 || [playURLString containsString:@"403"]) {
-            playURLString = [NSString stringWithFormat:@"https://music.163.com/song/media/outer/url?id=%@.mp3", resolvedId];
-            NSLog(@"[NLSongService] 接口返回空或 403，使用外链兜底 url=%@", playURLString);
-        } else {
-            NSLog(@"[NLSongService] 获取成功 url=%@", playURLString);
-        }
-
-        NSURL *playURL = [NSURL URLWithString:playURLString];
+        NSLog(@"[NLSongService] 获取播放 URL 成功 songId=%@", resolvedId);
         if (success) success(playURL);
     } failure:^(NSError * _Nonnull error) {
         NSLog(@"[NLSongService] 请求失败 songId=%@ error=%@", songId, error);
         if (failure) failure(error);
     }];
+}
+
++ (NSURL *)playableURLFromResponseObject:(id)responseObject error:(NSError **)error {
+    if (![responseObject isKindOfClass:[NSDictionary class]]) {
+        if (error) *error = [NLSongService playableURLErrorWithCode:NLSongServiceResponseBodyInvalid userInfo:nil];
+        return nil;
+    }
+
+    NSDictionary *response = (NSDictionary *)responseObject;
+    NSArray *dataArray = response[@"data"];
+    if (![dataArray isKindOfClass:[NSArray class]] || dataArray.count == 0) {
+        if (error) *error = [NLSongService playableURLErrorWithCode:NLSongServiceResponseMissingPlayableURL userInfo:nil];
+        return nil;
+    }
+
+    id item = dataArray[0];
+    if (![item isKindOfClass:[NSDictionary class]]) {
+        if (error) *error = [NLSongService playableURLErrorWithCode:NLSongServiceResponseMissingPlayableURL userInfo:nil];
+        return nil;
+    }
+
+    id urlObject = ((NSDictionary *)item)[@"url"];
+    if (![urlObject isKindOfClass:[NSString class]] || ((NSString *)urlObject).length == 0) {
+        if (error) *error = [NLSongService playableURLErrorWithCode:NLSongServiceResponseMissingPlayableURL userInfo:nil];
+        return nil;
+    }
+
+    NSURL *playURL = [NSURL URLWithString:(NSString *)urlObject];
+    if (!playURL || !playURL.scheme.length || !playURL.host.length) {
+        if (error) *error = [NLSongService playableURLErrorWithCode:NLSongServicePlayableURLInvalid userInfo:nil];
+        return nil;
+    }
+
+    NSString *scheme = playURL.scheme.lowercaseString;
+    if (![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"]) {
+        if (error) {
+            *error = [NLSongService playableURLErrorWithCode:NLSongServicePlayableURLInvalid
+                                                    userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"不支持的播放链接协议: %@", scheme]}];
+        }
+        return nil;
+    }
+
+    return playURL;
+}
+
++ (NSError *)playableURLErrorWithCode:(NSInteger)code userInfo:(NSDictionary *)userInfo {
+    NSMutableDictionary *merged = [NSMutableDictionary dictionary];
+    if (userInfo) [merged addEntriesFromDictionary:userInfo];
+    if (!merged[NSLocalizedDescriptionKey]) {
+        merged[NSLocalizedDescriptionKey] = NLSongServiceDescriptionForCode(code, @"播放链接不可用");
+    }
+    return [NSError errorWithDomain:@"NLSongService" code:code userInfo:merged];
 }
 
 - (void)fetchLyricWithSongId:(NSString *)songId

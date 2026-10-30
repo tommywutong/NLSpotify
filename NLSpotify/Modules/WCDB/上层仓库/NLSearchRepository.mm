@@ -1,8 +1,6 @@
 //
-//  NLSearchRepository.m
+//  NLSearchRepository.mm
 //  NLSpotify
-//
-//  Created by 吴桐 on 2026/2/23.
 //
 
 #import "NLSearchRepository.h"
@@ -11,56 +9,55 @@
 
 static NSString * const kSearchHistoryTableName = @"SearchHistoryTable";
 
+static void NLCompleteSearchWrite(BOOL success, void (^completion)(BOOL)) {
+    if (!completion) return;
+    dispatch_async(dispatch_get_main_queue(), ^{ completion(success); });
+}
+
 @implementation NLSearchRepository
 
 + (WCTDatabase *)safeDatabase {
-    WCTDatabase *db = [NLDataBaseManager sharedManager].database;
-    [db createTable:kSearchHistoryTableName withClass:NLSearchRecord.class];
-    return db;
+    return [NLDataBaseManager sharedManager].database;
 }
 
-+ (BOOL)addSearchRecord:(NSString *)keyword {
-    if (keyword.length == 0) return NO;
-
++ (void)addSearchRecord:(NSString *)keyword completion:(void (^)(BOOL))completion {
+    if (keyword.length == 0) {
+        NLCompleteSearchWrite(NO, completion);
+        return;
+    }
     NLSearchRecord *record = [[NLSearchRecord alloc] initWithKeyword:keyword];
-    BOOL result = [[self safeDatabase] insertOrReplaceObject:record intoTable:kSearchHistoryTableName];
-
-    if (!result) NSLog(@"保存搜索记录失败");
-    return result;
+    [[NLDataBaseManager sharedManager] performWrite:^BOOL(WCTDatabase *database) {
+        return [database insertOrReplaceObject:record intoTable:kSearchHistoryTableName];
+    } completionQueue:dispatch_get_main_queue() completion:completion];
 }
 
 + (NSArray<NLSearchRecord *> *)allSearchRecords {
-    NSArray<NLSearchRecord *> *records = [[self safeDatabase] getObjectsOfClass:NLSearchRecord.class
-                                                                      fromTable:kSearchHistoryTableName];
-
+    WCTDatabase *database = [self safeDatabase];
+    NSArray<NLSearchRecord *> *records = database ? [database getObjectsOfClass:NLSearchRecord.class
+                                                                        fromTable:kSearchHistoryTableName] : nil;
     if (!records || records.count == 0) return @[];
-    NSArray *sortedRecords = [records sortedArrayUsingComparator:^NSComparisonResult(NLSearchRecord *obj1, NLSearchRecord *obj2) {
-        if (obj1.timestamp > obj2.timestamp) {
-            return NSOrderedAscending;  // 降序：时间戳越大的（越新），排在越前面
-        } else if (obj1.timestamp < obj2.timestamp) {
-            return NSOrderedDescending;
-        }
-        return NSOrderedSame;
+    NSArray<NLSearchRecord *> *sortedRecords = [records sortedArrayUsingComparator:^NSComparisonResult(NLSearchRecord *left, NLSearchRecord *right) {
+        if (left.timestamp > right.timestamp) return NSOrderedAscending;
+        if (left.timestamp < right.timestamp) return NSOrderedDescending;
+        return [left.keyword compare:right.keyword];
     }];
-    if (sortedRecords.count > 20) {
-        return [sortedRecords subarrayWithRange:NSMakeRange(0, 20)];
+    return sortedRecords.count > 20 ? [sortedRecords subarrayWithRange:NSMakeRange(0, 20)] : sortedRecords;
+}
+
++ (void)clearAllSearchRecordsWithCompletion:(void (^)(BOOL))completion {
+    [[NLDataBaseManager sharedManager] performWrite:^BOOL(WCTDatabase *database) {
+        return [database deleteFromTable:kSearchHistoryTableName];
+    } completionQueue:dispatch_get_main_queue() completion:completion];
+}
+
++ (void)removeSearchRecord:(NSString *)keyword completion:(void (^)(BOOL))completion {
+    if (keyword.length == 0) {
+        NLCompleteSearchWrite(NO, completion);
+        return;
     }
-    return sortedRecords;
-}
-
-+ (BOOL)clearAllSearchRecords {
-    BOOL result = [[self safeDatabase] deleteFromTable:kSearchHistoryTableName];
-
-    if (!result) NSLog(@"清空搜索记录失败");
-    return result;
-}
-
-+ (BOOL)removeSearchRecord:(NSString *)keyword {
-    if (keyword.length == 0) return NO;
-    BOOL result = [[self safeDatabase] deleteFromTable:kSearchHistoryTableName
-                                                 where:NLSearchRecord.keyword == keyword];
-    if (!result) NSLog(@"删除单条搜索记录失败");
-    return result;
+    [[NLDataBaseManager sharedManager] performWrite:^BOOL(WCTDatabase *database) {
+        return [database deleteFromTable:kSearchHistoryTableName where:NLSearchRecord.keyword == keyword];
+    } completionQueue:dispatch_get_main_queue() completion:completion];
 }
 
 @end

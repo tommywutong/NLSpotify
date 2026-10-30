@@ -6,11 +6,13 @@
 
 #import "NLPlayerManager.h"
 #import <AVFoundation/AVFoundation.h>
+#import <UIKit/UIKit.h>
 #import "NLSongService.h"
 #import "NLSongRepository.h"
 #import "SDWebImage/SDWebImage.h"
 #import "NLResourceLoader.h"
 #import "NLCacheManager.h"
+#import "NLOfflineAudioStore.h"
 
 @interface NLResourceLoader (CacheManagerInjection)
 @property (nonatomic, strong) NLCacheManager *cacheManager;
@@ -21,6 +23,16 @@
 //NSString * const NLPlayerProgressDidChangeNotification = @"NLPlayerProgressDidChangeNotification";//  用于通知进度的变化
 
 static void *kPlayerCurrentItemStatusContext = &kPlayerCurrentItemStatusContext;
+static void *kPlayerTimeControlStatusContext = &kPlayerTimeControlStatusContext;
+
+static dispatch_queue_t NLAudioSessionQueue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        queue = dispatch_queue_create("com.nlspotify.audio-session", DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
+}
 
 @interface NLPlayerManager ()
 @property (nonatomic, strong, readwrite) NLSong *currentSong;
@@ -40,16 +52,40 @@ static void *kPlayerCurrentItemStatusContext = &kPlayerCurrentItemStatusContext;
 @property (nonatomic, strong) NLCacheManager *cacheManager;
 
 @property (nonatomic, strong) id timeObserver;  //周期性时间监听
+@property (nonatomic, strong) AVPlayer *timeObserverOwner;
+@property (nonatomic, strong) AVPlayer *observedPlayer;
 @property (nonatomic, strong) AVPlayerItem *observedItem; // 当前被 KVO 的 item（强持有，避免快速切歌时 item 先释放导致 KVO 崩溃）
 @property (nonatomic, strong) id endTimeObserver;       // 播放结束观察
 
 @property (nonatomic, assign) NSUInteger playSwitchToken; // 丢弃过期异步回调（连续快速切歌）
-@property (nonatomic, assign) BOOL wantsToPlay;
+@property (nonatomic, assign) NSUInteger lastRecordedPlaybackToken;
+@property (nonatomic, assign) BOOL hasRecordedPlaybackToken;
+@property (nonatomic, assign, readwrite) BOOL wantsToPlay;
+@property (nonatomic, assign) BOOL audioSessionInterrupted;
+@property (nonatomic, assign) BOOL resumeAfterInterruption;
+@property (nonatomic, assign) BOOL audioSessionActivated;
+@property (nonatomic, assign) BOOL audioSessionActivationPending;
+@property (nonatomic, assign) NSUInteger audioSessionGeneration;
+@property (nonatomic, strong) NSURL *currentSourceURL;
+@property (nonatomic, strong) NSURL *pendingSourceURL;
+@property (nonatomic, assign) BOOL requiresPlaybackReload;
+@property (nonatomic, assign) BOOL hasPendingRestore;
+@property (nonatomic, assign) BOOL restoringPosition;
+@property (nonatomic, assign) NSTimeInterval pendingRestoreTime;
+@property (nonatomic, strong) NSMutableArray<MPRemoteCommand *> *remoteCommands;
+@property (nonatomic, strong) NSMutableArray<id> *remoteCommandTargets;
 
 @property (nonatomic, assign) float lastLoggedCacheProgress; // 用于缓存跟踪日志，仅变化时打印
 @property (nonatomic, copy) NSString *lastLoggedCacheURL;    // 上一首打印时的 URL，切歌后重新打印
 - (void)startPlaybackWithURL:(NSURL *)url cacheKey:(NSString *)cacheKey token:(NSUInteger)token;
 - (void)startSongAfterCacheReady:(NLSong *)song token:(NSUInteger)token;
+- (void)tearDownCurrentPlaybackReleasingPlayer:(BOOL)releasePlayer;
+- (void)installPlayerItem:(AVPlayerItem *)item sourceURL:(NSURL *)url;
+- (void)synchronizePlaybackState;
+- (void)applyPlaybackIntent;
+- (void)requestAudioSessionActivation;
+- (void)invalidateAudioSessionDeactivating:(BOOL)deactivate;
+- (void)configureAudioSessionAfterReset;
 @end
 
 @implementation NLPlayerManager
@@ -80,11 +116,26 @@ static void *kPlayerCurrentItemStatusContext = &kPlayerCurrentItemStatusContext;
         _progressSignal = _progressSubject;
         _cacheProgressSignal = _cacheProgressSubject;
         _hasPlaylistSignal = _hasPlaylistSubject;
+        NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+        AVAudioSession *session = AVAudioSession.sharedInstance;
+        [center addObserver:self selector:@selector(handleAudioInterruption:) name:AVAudioSessionInterruptionNotification object:session];
+        [center addObserver:self selector:@selector(handleAudioRouteChange:) name:AVAudioSessionRouteChangeNotification object:session];
+        [center addObserver:self selector:@selector(handleMediaServicesReset:) name:AVAudioSessionMediaServicesWereResetNotification object:session];
+        [center addObserver:self selector:@selector(handleApplicationDidBecomeActive:) name:UIApplicationDidBecomeActiveNotification object:nil];
         [self setupRemoteCommands];
         [self updateNowPlayingInfo];
     }
     return self;
 }
+- (void)dealloc {
+    [NSNotificationCenter.defaultCenter removeObserver:self];
+    [self tearDownCurrentPlaybackReleasingPlayer:YES];
+    [self invalidateAudioSessionDeactivating:self.audioSessionActivated || self.audioSessionActivationPending];
+    for (NSUInteger index = 0; index < self.remoteCommands.count; index++) {
+        [self.remoteCommands[index] removeTarget:self.remoteCommandTargets[index]];
+    }
+}
+
 
 - (NSString *)cacheKeyForSong:(NLSong *)song URL:(NSURL *)url {
     return [self.cacheManager cacheIdentityForURL:url cacheKey:song.songId];
@@ -105,7 +156,117 @@ static void *kPlayerCurrentItemStatusContext = &kPlayerCurrentItemStatusContext;
     [self.resourceLoader invalidateAndCancelAll];
     self.resourceLoader = nil;
 }
+
+- (void)tearDownCurrentPlaybackReleasingPlayer:(BOOL)releasePlayer {
+    // Deregister from the original owners before changing player/item references.
+    [self removePeriodicTimeObserver];
+    [self uninstallCurrentItemObserver];
+    if (self.observedPlayer) {
+        [self.observedPlayer removeObserver:self forKeyPath:NSStringFromSelector(@selector(timeControlStatus))
+                                   context:kPlayerTimeControlStatusContext];
+        self.observedPlayer = nil;
+    }
+    [self invalidateCurrentStreamingPlayback];
+    [self.player pause];
+    if (self.player.currentItem) [self.player replaceCurrentItemWithPlayerItem:nil];
+    self.currentPlayerItem = nil;
+    self.currentSourceURL = nil;
+    self.restoringPosition = NO;
+    if (releasePlayer) self.player = nil;
+}
+
+- (void)installPlayerItem:(AVPlayerItem *)item sourceURL:(NSURL *)url {
+    self.currentPlayerItem = item;
+    self.currentSourceURL = url;
+    if (!self.player) self.player = [[AVPlayer alloc] initWithPlayerItem:item];
+    else [self.player replaceCurrentItemWithPlayerItem:item];
+    self.player.volume = self.volume;
+    self.observedPlayer = self.player;
+    [self.observedPlayer addObserver:self forKeyPath:NSStringFromSelector(@selector(timeControlStatus))
+                            options:NSKeyValueObservingOptionInitial | NSKeyValueObservingOptionNew
+                            context:kPlayerTimeControlStatusContext];
+    [self addPeriodicTimeObserver];
+    [self observeCurrentItemForReady:item];
+    [self observeCurrentItemForEnd:item];
+    [self applyPlaybackIntent];
+}
+
+- (void)synchronizePlaybackState {
+    AVPlayerItem *item = self.currentPlayerItem;
+    if (!self.currentSong && !item) {
+        [self setPlaybackState:NLPlaybackStateIdle];
+    } else if (item.status == AVPlayerItemStatusFailed ||
+               (self.playbackState == NLPlaybackStateError && !self.wantsToPlay)) {
+        [self setPlaybackState:NLPlaybackStateError];
+    } else if (!self.wantsToPlay || self.audioSessionInterrupted) {
+        if (self.player.timeControlStatus != AVPlayerTimeControlStatusPaused) [self.player pause];
+        [self setPlaybackState:NLPlaybackStatePaused];
+    } else if (!item || item.status != AVPlayerItemStatusReadyToPlay ||
+               self.restoringPosition || self.audioSessionActivationPending) {
+        [self setPlaybackState:NLPlaybackStateLoading];
+    } else {
+        switch (self.player.timeControlStatus) {
+            case AVPlayerTimeControlStatusPlaying:
+                [self setPlaybackState:NLPlaybackStatePlaying];
+                break;
+            case AVPlayerTimeControlStatusWaitingToPlayAtSpecifiedRate:
+                [self setPlaybackState:NLPlaybackStateLoading];
+                break;
+            case AVPlayerTimeControlStatusPaused:
+                [self setPlaybackState:NLPlaybackStatePaused];
+                break;
+        }
+    }
+}
+
+- (void)applyPlaybackIntent {
+    AVPlayerItem *item = self.currentPlayerItem;
+    if (!self.wantsToPlay || self.audioSessionInterrupted) {
+        [self.player pause];
+        [self synchronizePlaybackState];
+        return;
+    }
+    if (!item || item.status == AVPlayerItemStatusFailed || self.restoringPosition) {
+        [self synchronizePlaybackState];
+        return;
+    }
+    if (self.hasPendingRestore) {
+        if (item.status != AVPlayerItemStatusReadyToPlay) {
+            [self synchronizePlaybackState];
+            return;
+        }
+        self.hasPendingRestore = NO;
+        self.restoringPosition = YES;
+        NSUInteger token = self.playSwitchToken;
+        AVPlayer *player = self.player;
+        CMTime position = CMTimeMakeWithSeconds(self.pendingRestoreTime, NSEC_PER_SEC);
+        __weak typeof(self) weakSelf = self;
+        [player seekToTime:position toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero completionHandler:^(BOOL finished) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                __strong typeof(weakSelf) self = weakSelf;
+                if (!self || token != self.playSwitchToken || self.player != player || self.currentPlayerItem != item) return;
+                self.restoringPosition = NO;
+                [self applyPlaybackIntent];
+            });
+        }];
+        [self synchronizePlaybackState];
+        return;
+    }
+    if (!self.audioSessionActivated) {
+        [self requestAudioSessionActivation];
+        [self synchronizePlaybackState];
+        return;
+    }
+    [self.player play];
+    [self synchronizePlaybackState];
+}
+
 - (void)playWithPlaylist:(NSArray<NLSong *> *)playlist startIndex:(NSInteger)index {
+    if (!NSThread.isMainThread) {
+        NSArray<NLSong *> *snapshot = [playlist copy];
+        dispatch_async(dispatch_get_main_queue(), ^{ [self playWithPlaylist:snapshot startIndex:index]; });
+        return;
+    }
     if (!playlist || playlist.count == 0 || index < 0 || index >= playlist.count) return;
     self.playlist = [playlist copy];
     self.currentIndex = index;
@@ -113,6 +274,10 @@ static void *kPlayerCurrentItemStatusContext = &kPlayerCurrentItemStatusContext;
     [self playSongAtIndexIfNeeded:index];
 }
 - (void)playWithURL:(NSURL *)url {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self playWithURL:url]; });
+        return;
+    }
     if (!url) {
         [self setPlaybackState:NLPlaybackStateError];
         return;
@@ -134,8 +299,7 @@ static void *kPlayerCurrentItemStatusContext = &kPlayerCurrentItemStatusContext;
     cacheManager.currentPlayingURL = url;
     cacheManager.currentPlayingCacheKey = cacheKey;
     [cacheManager touchAccessTimeForURL:url cacheKey:cacheKey];
-    [self removePeriodicTimeObserver];
-    [self invalidateCurrentStreamingPlayback];
+    [self tearDownCurrentPlaybackReleasingPlayer:NO];
     [self updateCacheProgressForURL:url cacheKey:cacheKey];
     self.lastLoggedCacheURL = nil;
     self.lastLoggedCacheProgress = -1.f;
@@ -165,17 +329,7 @@ static void *kPlayerCurrentItemStatusContext = &kPlayerCurrentItemStatusContext;
     }];
 
     AVPlayerItem *item = [AVPlayerItem playerItemWithAsset:asset];
-    self.currentPlayerItem = item;
-    [self uninstallCurrentItemObserver];
-    if (!self.player) self.player = [[AVPlayer alloc] initWithPlayerItem:item];
-    else [self.player replaceCurrentItemWithPlayerItem:item];
-    [self addPeriodicTimeObserver];
-    [self observeCurrentItemForReady:item];
-    [self observeCurrentItemForEnd:item];
-    self.player.volume = self.volume;
-    [self setPlaybackState:self.wantsToPlay ? NLPlaybackStateLoading : NLPlaybackStatePaused];
-    [self setupAudioSession];
-    if (self.wantsToPlay) [self.player play];
+    [self installPlayerItem:item sourceURL:url];
 }
 
 #pragma mark - 播放入口
@@ -187,48 +341,56 @@ static void *kPlayerCurrentItemStatusContext = &kPlayerCurrentItemStatusContext;
         return;
     }
     NSURL *localURL = [NSURL fileURLWithPath:cachePath];
+    [self tearDownCurrentPlaybackReleasingPlayer:NO];
     AVPlayerItem *item = [AVPlayerItem playerItemWithURL:localURL];
-    self.currentPlayerItem = item;
-    [self uninstallCurrentItemObserver];
-    if (!self.player) self.player = [[AVPlayer alloc] initWithPlayerItem:item];
-    else [self.player replaceCurrentItemWithPlayerItem:item];
-    [self addPeriodicTimeObserver];
-    [self observeCurrentItemForReady:item];
-    [self observeCurrentItemForEnd:item];
-    self.player.volume = self.volume;
-    [self setPlaybackState:self.wantsToPlay ? NLPlaybackStateLoading : NLPlaybackStatePaused];
-    [self setupAudioSession];
-    if (self.wantsToPlay) [self.player play];
+    [self installPlayerItem:item sourceURL:localURL];
 }
 
 
 #pragma mark - 播放控制
 
 - (void)play {
-    if (!self.currentSong) return;
-    self.wantsToPlay = YES;
-    if (!self.player.currentItem) {
-        [self setPlaybackState:NLPlaybackStateLoading];
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self play]; });
         return;
     }
-    [self.player play];
-    if (self.player.currentItem.status == AVPlayerItemStatusReadyToPlay) {
-        [self setPlaybackState:NLPlaybackStatePlaying];
-    } else if (self.playbackState != NLPlaybackStateLoading) {
-        [self setPlaybackState:NLPlaybackStateLoading];
+    if (!self.currentSong) return;
+    self.wantsToPlay = YES;
+    if (self.audioSessionInterrupted) self.resumeAfterInterruption = YES;
+    if (!self.player.currentItem && self.requiresPlaybackReload) {
+        self.requiresPlaybackReload = NO;
+        NSURL *source = self.pendingSourceURL;
+        self.pendingSourceURL = nil;
+        NLSong *song = self.currentSong;
+        NSUInteger token = self.playSwitchToken;
+        __weak typeof(self) weakSelf = self;
+        [self.cacheManager whenReadyOnQueue:dispatch_get_main_queue() perform:^{
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self || token != self.playSwitchToken || self.currentSong != song) return;
+            if (source.isFileURL) [self playFullyCachedSongAtPath:source.path];
+            else if (source) [self playWithURL:source];
+            else [self startSongAfterCacheReady:song token:token];
+        }];
     }
-    [self updateNowPlayingInfo];
+    [self applyPlaybackIntent];
 }
 
 - (void)pause {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self pause]; });
+        return;
+    }
     if (!self.currentSong) return;
     self.wantsToPlay = NO;
-    [self.player pause];
-    [self setPlaybackState:NLPlaybackStatePaused];
-    [self updateNowPlayingInfo];
+    self.resumeAfterInterruption = NO;
+    [self applyPlaybackIntent];
 }
 
 - (void)togglePlayPause {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self togglePlayPause]; });
+        return;
+    }
     if (self.wantsToPlay) {
         [self pause];
     } else {
@@ -239,16 +401,20 @@ static void *kPlayerCurrentItemStatusContext = &kPlayerCurrentItemStatusContext;
 //  pause为真正的暂停，stop为取消
 
 - (void)stop {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self stop]; });
+        return;
+    }
     self.wantsToPlay = NO;
     self.playSwitchToken += 1;
-    [self invalidateCurrentStreamingPlayback];
+    self.resumeAfterInterruption = NO;
+    self.requiresPlaybackReload = NO;
+    self.pendingSourceURL = nil;
+    self.hasPendingRestore = NO;
+    [self tearDownCurrentPlaybackReleasingPlayer:YES];
+    [self invalidateAudioSessionDeactivating:self.audioSessionActivated || self.audioSessionActivationPending];
     self.cacheManager.currentPlayingURL = nil;
     self.cacheManager.currentPlayingCacheKey = nil;
-    [self uninstallCurrentItemObserver];
-    [self.player pause];
-    [self.player replaceCurrentItemWithPlayerItem:nil];
-    self.currentPlayerItem = nil;
-    self.player = nil;
     self.currentSong = nil;
     self.playlist = nil;
     [self.hasPlaylistSubject sendNext:@NO];
@@ -304,12 +470,20 @@ static void *kPlayerCurrentItemStatusContext = &kPlayerCurrentItemStatusContext;
 }
 
 - (void)playNext {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self playNext]; });
+        return;
+    }
     NSInteger idx = [self indexForNextInMode:self.playMode];
     if (idx < 0) return;
     [self playSongAtIndexIfNeeded:idx];
 }
 
 - (void)playPrevious {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self playPrevious]; });
+        return;
+    }
     NSInteger idx = [self indexForPreviousInMode:self.playMode];
     if (idx < 0) return;
     [self playSongAtIndexIfNeeded:idx];
@@ -319,23 +493,25 @@ static void *kPlayerCurrentItemStatusContext = &kPlayerCurrentItemStatusContext;
 
 /// 同一个入口处理列表切换、直接选曲和网络 URL 的过期回调。
 - (void)playSongAtIndexIfNeeded:(NSInteger)index {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self playSongAtIndexIfNeeded:index]; });
+        return;
+    }
     if (index < 0 || index >= (NSInteger)self.playlist.count) return;
     self.playSwitchToken += 1;
     NSUInteger token = self.playSwitchToken;
     self.wantsToPlay = YES;
+    self.resumeAfterInterruption = self.audioSessionInterrupted;
+    self.requiresPlaybackReload = NO;
+    self.pendingSourceURL = nil;
+    self.hasPendingRestore = NO;
     self.currentIndex = index;
     NLSong *song = self.playlist[index];
     self.currentSong = song;
     [self.progressSubject sendNext:@(0.f)];
-    [NLSongRepository addPlayHistory:song];
     [self postSongChangedNotification];
 
-    [self removePeriodicTimeObserver];
-    [self invalidateCurrentStreamingPlayback];
-    [self uninstallCurrentItemObserver];
-    [self.player pause];
-    [self.player replaceCurrentItemWithPlayerItem:nil];
-    self.currentPlayerItem = nil;
+    [self tearDownCurrentPlaybackReleasingPlayer:NO];
     NLCacheManager *cache = self.cacheManager;
     cache.currentPlayingURL = nil;
     cache.currentPlayingCacheKey = nil;
@@ -353,6 +529,13 @@ static void *kPlayerCurrentItemStatusContext = &kPlayerCurrentItemStatusContext;
 - (void)startSongAfterCacheReady:(NLSong *)song token:(NSUInteger)token {
     if (token != self.playSwitchToken || self.currentSong != song) return;
     NLCacheManager *cache = self.cacheManager;
+    NSURL *offlineURL = [[NLOfflineAudioStore sharedStore] localFileURLForSongID:song.songId];
+    if (offlineURL) {
+        self.latestCacheProgress = 1.f;
+        [self.cacheProgressSubject sendNext:@(1.f)];
+        [self playFullyCachedSongAtPath:offlineURL.path];
+        return;
+    }
     NSString *cacheKey = [cache cacheIdentityForURL:song.playURL cacheKey:song.songId];
     if (song.songId.length && [cache isFullyCachedForURL:song.playURL cacheKey:cacheKey]) {
         cache.currentPlayingURL = song.playURL;
@@ -428,6 +611,10 @@ static void *kPlayerCurrentItemStatusContext = &kPlayerCurrentItemStatusContext;
 }
 
 - (void)seekToProgress:(float)progress {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self seekToProgress:progress]; });
+        return;
+    }
     AVPlayerItem *item = self.player.currentItem;
     if (!item) return;
 
@@ -442,9 +629,18 @@ static void *kPlayerCurrentItemStatusContext = &kPlayerCurrentItemStatusContext;
     float clamped = fminf(fmaxf(progress, 0.f), 1.f);
     CMTime target = CMTimeMultiplyByFloat64(duration, clamped);
 
-    [self.player seekToTime:target
-            toleranceBefore:kCMTimeZero
-             toleranceAfter:kCMTimeZero];
+    NSUInteger token = self.playSwitchToken;
+    AVPlayer *player = self.player;
+    __weak typeof(self) weakSelf = self;
+    [player seekToTime:target toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero completionHandler:^(BOOL finished) {
+        if (!finished) return;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self || token != self.playSwitchToken || self.player != player || self.currentPlayerItem != item) return;
+            [self.progressSubject sendNext:@(self.currentProgress)];
+            [self synchronizePlaybackState]; // Also publish the actual seek time to Now Playing while paused.
+        });
+    }];
 }
 
 - (void)setVolume:(float)volume {
@@ -459,22 +655,14 @@ static void *kPlayerCurrentItemStatusContext = &kPlayerCurrentItemStatusContext;
     __weak typeof(self) weakSelf = self;
     AVPlayerItem *observedItem = self.currentPlayerItem;
     NSUInteger token = self.playSwitchToken;
-    dispatch_queue_t timeQueue = dispatch_queue_create("com.nlspotify.timeobserver", DISPATCH_QUEUE_SERIAL);
-    self.timeObserver = [self.player addPeriodicTimeObserverForInterval:CMTimeMakeWithSeconds(0.5, NSEC_PER_SEC)
-                                                                    queue:timeQueue
-                                                               usingBlock:^(CMTime ignoredTime) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            __strong typeof(weakSelf) strongSelf = weakSelf;
-            if (!strongSelf || token != strongSelf.playSwitchToken ||
-                strongSelf.currentPlayerItem != observedItem || strongSelf.player.currentItem != observedItem) return;
-
-            [strongSelf.progressSubject sendNext:@(strongSelf.currentProgress)];
-            NSURL *url = strongSelf.currentSong.playURL;
-            NSString *urlString = url.absoluteString ?: @"";
-            if (![urlString isEqualToString:strongSelf.lastLoggedCacheURL]) {
-                strongSelf.lastLoggedCacheURL = urlString;
-            }
-        });
+    self.timeObserverOwner = self.player;
+    self.timeObserver = [self.timeObserverOwner addPeriodicTimeObserverForInterval:CMTimeMakeWithSeconds(0.5, NSEC_PER_SEC)
+                                                                          queue:dispatch_get_main_queue()
+                                                                     usingBlock:^(CMTime ignoredTime) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self || token != self.playSwitchToken ||
+            self.currentPlayerItem != observedItem || self.player.currentItem != observedItem) return;
+        [self.progressSubject sendNext:@(self.currentProgress)];
     }];
 }
 
@@ -511,12 +699,8 @@ static void *kPlayerCurrentItemStatusContext = &kPlayerCurrentItemStatusContext;
 }
 - (void)uninstallCurrentItemObserver {
     if (self.observedItem) {
-        @try {
-            [self.observedItem removeObserver:self
-                                    forKeyPath:NSStringFromSelector(@selector(status))
-                                       context:kPlayerCurrentItemStatusContext];
-        } @catch (NSException *exception) {
-        }
+        [self.observedItem removeObserver:self forKeyPath:NSStringFromSelector(@selector(status))
+                                 context:kPlayerCurrentItemStatusContext];
         self.observedItem = nil;
     }
     if (self.endTimeObserver) {
@@ -549,7 +733,7 @@ static void *kPlayerCurrentItemStatusContext = &kPlayerCurrentItemStatusContext;
     switch (self.playMode) {
         case NLPlayModeSingleLoop:
             [self.player seekToTime:kCMTimeZero];
-            if (self.wantsToPlay) [self.player play];
+            [self applyPlaybackIntent];
             break;
         case NLPlayModeListLoop:
         case NLPlayModeRandom:
@@ -559,26 +743,22 @@ static void *kPlayerCurrentItemStatusContext = &kPlayerCurrentItemStatusContext;
 }
 
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary<NSKeyValueChangeKey,id> *)change context:(void *)context {
-    if (context != kPlayerCurrentItemStatusContext || object != self.player.currentItem ||
-        ![keyPath isEqualToString:NSStringFromSelector(@selector(status))]) return;
-
-    AVPlayerItemStatus status = [change[NSKeyValueChangeNewKey] integerValue];
+    if (context != kPlayerCurrentItemStatusContext && context != kPlayerTimeControlStatusContext) {
+        [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+        return;
+    }
+    BOOL itemEvent = context == kPlayerCurrentItemStatusContext;
+    if (itemEvent ? object != self.observedItem : object != self.observedPlayer) return;
+    AVPlayerItem *item = self.currentPlayerItem;
+    AVPlayer *player = self.player;
+    NSUInteger token = self.playSwitchToken;
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf || object != strongSelf.currentPlayerItem || object != strongSelf.player.currentItem) return;
-        if (status == AVPlayerItemStatusReadyToPlay) {
-            if (strongSelf.wantsToPlay) {
-                [strongSelf.player play];
-                [strongSelf setPlaybackState:NLPlaybackStatePlaying];
-            } else {
-                [strongSelf.player pause];
-                [strongSelf setPlaybackState:NLPlaybackStatePaused];
-            }
-            [strongSelf updateNowPlayingInfo];
-        } else if (status == AVPlayerItemStatusFailed) {
-            [strongSelf setPlaybackState:NLPlaybackStateError];
-        }
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self || token != self.playSwitchToken || self.player != player ||
+            self.currentPlayerItem != item || player.currentItem != item) return;
+        if (itemEvent && item.status == AVPlayerItemStatusReadyToPlay) [self applyPlaybackIntent];
+        else [self synchronizePlaybackState];
     });
 }
 
@@ -594,8 +774,22 @@ static void *kPlayerCurrentItemStatusContext = &kPlayerCurrentItemStatusContext;
         });
         return;
     }
+    if (state == NLPlaybackStateError) {
+        self.wantsToPlay = NO;
+        self.resumeAfterInterruption = NO;
+        [self.player pause];
+    }
     _playbackState = state;
     [self.playbackStateSubject sendNext:@(state)];
+    if (state == NLPlaybackStatePlaying && self.currentSong.songId.length > 0) {
+        NSUInteger token = self.playSwitchToken;
+        if (!self.hasRecordedPlaybackToken || self.lastRecordedPlaybackToken != token) {
+            self.hasRecordedPlaybackToken = YES;
+            self.lastRecordedPlaybackToken = token;
+            NLSong *song = self.currentSong;
+            [NLSongRepository recordPlaybackStart:song completion:^(BOOL success) { (void)success; }];
+        }
+    }
     [self updateNowPlayingInfo];
 }
 - (void)postSongChangedNotification {
@@ -606,6 +800,10 @@ static void *kPlayerCurrentItemStatusContext = &kPlayerCurrentItemStatusContext;
 }
 
 - (void)setPlayMode:(NLPlayMode)playMode {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self setPlayMode:playMode]; });
+        return;
+    }
     _playMode = playMode;
 }
 
@@ -613,39 +811,170 @@ static void *kPlayerCurrentItemStatusContext = &kPlayerCurrentItemStatusContext;
 #pragma mark - 用于兼容灵动岛、锁屏播放等
 
 - (void)setupAudioSession {
-    AVAudioSession *session = [AVAudioSession sharedInstance];
-    NSError *error = nil;
-
-    [session setCategory:AVAudioSessionCategoryPlayback error:&error];
-    if (error) {
-        NSLog(@"[Player] AudioSession Category Error: %@", error);
-        error = nil;
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self setupAudioSession]; });
+        return;
     }
-    [session setActive:YES error:&error];
-    if (error) {
-        NSLog(@"[Player] AudioSession Active Error: %@", error);
+    if (!self.audioSessionInterrupted) [self requestAudioSessionActivation];
+}
+
+- (void)requestAudioSessionActivation {
+    if (self.audioSessionActivated || self.audioSessionActivationPending) return;
+    self.audioSessionActivationPending = YES;
+    NSUInteger generation = self.audioSessionGeneration;
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(NLAudioSessionQueue(), ^{
+        NSError *error = nil;
+        AVAudioSession *session = AVAudioSession.sharedInstance;
+        BOOL activated = [session setCategory:AVAudioSessionCategoryPlayback error:&error] &&
+            [session setActive:YES error:&error];
+        if (!activated) NSLog(@"[Player] AudioSession activation failed: %@", error.localizedDescription);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self || generation != self.audioSessionGeneration) return;
+            self.audioSessionActivationPending = NO;
+            self.audioSessionActivated = activated;
+            if (activated) [self applyPlaybackIntent];
+            else [self setPlaybackState:NLPlaybackStateError];
+        });
+    });
+}
+
+- (void)invalidateAudioSessionDeactivating:(BOOL)deactivate {
+    self.audioSessionGeneration += 1;
+    self.audioSessionActivationPending = NO;
+    self.audioSessionActivated = NO;
+    if (deactivate) {
+        // This follows any older activation on the same queue, even if its main callback is stale.
+        dispatch_async(NLAudioSessionQueue(), ^{
+            [AVAudioSession.sharedInstance setActive:NO
+                                        withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
+                                              error:nil];
+        });
     }
 }
 
+- (void)configureAudioSessionAfterReset {
+    NSUInteger generation = self.audioSessionGeneration;
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(NLAudioSessionQueue(), ^{
+        NSError *error = nil;
+        BOOL configured = [AVAudioSession.sharedInstance setCategory:AVAudioSessionCategoryPlayback error:&error];
+        if (!configured) NSLog(@"[Player] AudioSession category failed: %@", error.localizedDescription);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self || generation != self.audioSessionGeneration || configured) return;
+            if (self.currentSong) [self setPlaybackState:NLPlaybackStateError];
+        });
+    });
+}
+
+- (void)handleAudioInterruption:(NSNotification *)notification {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self handleAudioInterruption:notification]; });
+        return;
+    }
+    NSNumber *type = notification.userInfo[AVAudioSessionInterruptionTypeKey];
+    if (![type isKindOfClass:NSNumber.class]) return;
+    if (type.unsignedIntegerValue == AVAudioSessionInterruptionTypeBegan) {
+        if (self.audioSessionInterrupted) return;
+        self.audioSessionInterrupted = YES;
+        [self invalidateAudioSessionDeactivating:self.audioSessionActivationPending];
+        self.resumeAfterInterruption = self.wantsToPlay;
+        [self applyPlaybackIntent];
+    } else if (type.unsignedIntegerValue == AVAudioSessionInterruptionTypeEnded && self.audioSessionInterrupted) {
+        self.audioSessionInterrupted = NO;
+        AVAudioSessionInterruptionOptions options = [notification.userInfo[AVAudioSessionInterruptionOptionKey] unsignedIntegerValue];
+        BOOL resume = self.resumeAfterInterruption && self.wantsToPlay &&
+            (options & AVAudioSessionInterruptionOptionShouldResume) && self.currentSong;
+        self.resumeAfterInterruption = NO;
+        self.wantsToPlay = resume;
+        [self applyPlaybackIntent];
+    }
+}
+
+- (void)handleApplicationDidBecomeActive:(NSNotification *)notification {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self handleApplicationDidBecomeActive:notification]; });
+        return;
+    }
+    // Reconcile snapshots only; foregrounding is not a request to resume playback.
+    [self synchronizePlaybackState];
+    if (self.currentPlayerItem) [self.progressSubject sendNext:@(self.currentProgress)];
+}
+
+- (void)handleAudioRouteChange:(NSNotification *)notification {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self handleAudioRouteChange:notification]; });
+        return;
+    }
+    if ([notification.userInfo[AVAudioSessionRouteChangeReasonKey] unsignedIntegerValue] == AVAudioSessionRouteChangeReasonOldDeviceUnavailable) {
+        AVAudioSessionRouteDescription *previousRoute = notification.userInfo[AVAudioSessionRouteChangePreviousRouteKey];
+        NSArray<AVAudioSessionPortDescription *> *outputs = previousRoute.outputs;
+        // Missing route data: retain the privacy-safe pause policy.
+        BOOL lostExternalOutput = outputs.count == 0;
+        for (AVAudioSessionPortDescription *port in outputs) {
+            if (![port.portType isEqualToString:AVAudioSessionPortBuiltInSpeaker] &&
+                ![port.portType isEqualToString:AVAudioSessionPortBuiltInReceiver]) {
+                lostExternalOutput = YES;
+                break;
+            }
+        }
+        if (lostExternalOutput) [self pause];
+    }
+}
+
+- (void)handleMediaServicesReset:(NSNotification *)notification {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self handleMediaServicesReset:notification]; });
+        return;
+    }
+    NSURL *source = self.currentSourceURL ?: self.pendingSourceURL;
+    NSTimeInterval position = self.hasPendingRestore ? self.pendingRestoreTime : self.currentTime;
+    self.playSwitchToken += 1;
+    self.wantsToPlay = NO;
+    self.resumeAfterInterruption = NO;
+    self.audioSessionInterrupted = NO;
+    [self invalidateAudioSessionDeactivating:YES];
+    [self tearDownCurrentPlaybackReleasingPlayer:YES];
+    self.cacheManager.currentPlayingURL = nil;
+    self.cacheManager.currentPlayingCacheKey = nil;
+    self.pendingSourceURL = source;
+    self.pendingRestoreTime = position;
+    self.hasPendingRestore = position > 0;
+    self.requiresPlaybackReload = self.currentSong != nil;
+    // Apple requires explicit user action before restarting after a media-services reset.
+    [self configureAudioSessionAfterReset];
+    [self synchronizePlaybackState];
+}
+
+- (void)registerRemoteCommand:(MPRemoteCommand *)command handler:(MPRemoteCommandHandlerStatus (^)(MPRemoteCommandEvent *))handler {
+    id target = [command addTargetWithHandler:handler];
+    [self.remoteCommands addObject:command];
+    [self.remoteCommandTargets addObject:target];
+}
+
 - (void)setupRemoteCommands {
+    if (self.remoteCommandTargets.count > 0) return;
+    self.remoteCommands = [NSMutableArray arrayWithCapacity:5];
+    self.remoteCommandTargets = [NSMutableArray arrayWithCapacity:5];
     MPRemoteCommandCenter *commandCenter =
         [MPRemoteCommandCenter sharedCommandCenter];
 
     __weak typeof(self) weakSelf = self;
-    [commandCenter.playCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
+    [self registerRemoteCommand:commandCenter.playCommand handler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
         dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf play]; });
         return MPRemoteCommandHandlerStatusSuccess;
     }];
 
     // ⏸ Pause
-    [commandCenter.pauseCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
+    [self registerRemoteCommand:commandCenter.pauseCommand handler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
         dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf pause]; });
         return MPRemoteCommandHandlerStatusSuccess;
     }];
 
     //Seek
-    [commandCenter.changePlaybackPositionCommand
-     addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
+    [self registerRemoteCommand:commandCenter.changePlaybackPositionCommand handler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
 
         MPChangePlaybackPositionCommandEvent *e =
             (MPChangePlaybackPositionCommandEvent *)event;
@@ -657,12 +986,12 @@ static void *kPlayerCurrentItemStatusContext = &kPlayerCurrentItemStatusContext;
         return MPRemoteCommandHandlerStatusSuccess;
     }];
 
-    [commandCenter.nextTrackCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
+    [self registerRemoteCommand:commandCenter.nextTrackCommand handler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
         dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf playNext]; });
         return MPRemoteCommandHandlerStatusSuccess;
     }];
 
-    [commandCenter.previousTrackCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
+    [self registerRemoteCommand:commandCenter.previousTrackCommand handler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
         dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf playPrevious]; });
         return MPRemoteCommandHandlerStatusSuccess;
     }];
@@ -730,14 +1059,8 @@ static void *kPlayerCurrentItemStatusContext = &kPlayerCurrentItemStatusContext;
 }
 
 - (void)removePeriodicTimeObserver {
-    if (!self.timeObserver) return;
-    if (self.player) {
-        @try {
-            [self.player removeTimeObserver:self.timeObserver];
-        } @catch (NSException *exception) {
-            NSLog(@"[Player] 移除时间监听异常: %@", exception);
-        }
-    }
+    if (self.timeObserver) [self.timeObserverOwner removeTimeObserver:self.timeObserver];
     self.timeObserver = nil;
+    self.timeObserverOwner = nil;
 }
 @end

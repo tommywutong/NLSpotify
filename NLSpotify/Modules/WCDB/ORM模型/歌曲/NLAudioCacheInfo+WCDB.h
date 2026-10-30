@@ -12,7 +12,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface NLAudioCacheInfo (WCDB) <WCTTableCoding>
 
-WCDB_PROPERTY(urlMD5)
+WCDB_PROPERTY(cacheIdentifier)
 WCDB_PROPERTY(songId)
 WCDB_PROPERTY(totalLength)
 WCDB_PROPERTY(cachedRangesString)

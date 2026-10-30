@@ -77,7 +77,7 @@
         make.edges.equalTo(self.view);
     }];
 
-    CGFloat height = [UIScreen mainScreen].bounds.size.height * 0.25;
+    CGFloat height = (self.view.bounds.size.height > 0 ? self.view.bounds.size.height : self.view.window.windowScene.screen.bounds.size.height) * 0.25;
     height = MAX(220.0, height);
 
     [self.containerView mas_makeConstraints:^(MASConstraintMaker *make) {
@@ -157,11 +157,12 @@
     CGFloat offset = overlap > 0 ? -overlap : 0;
     [self.containerBottomConstraint setOffset:offset];
 
-    [UIView beginAnimations:nil context:NULL];
-    [UIView setAnimationDuration:duration];
-    [UIView setAnimationCurve:curve];
-    [self.view layoutIfNeeded];
-    [UIView commitAnimations];
+    [UIView animateWithDuration:duration
+                          delay:0
+                        options:(UIViewAnimationOptions)(curve << 16)
+                     animations:^{
+        [self.view layoutIfNeeded];
+    } completion:nil];
 }
 
 - (void)dismissSelf {

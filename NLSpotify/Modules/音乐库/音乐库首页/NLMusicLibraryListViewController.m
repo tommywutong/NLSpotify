@@ -19,6 +19,7 @@
 #import "NLPlayerManager.h"
 #import "NLSongService.h"
 #import "NLCacheManager.h"
+#import "NLOfflineAudioStore.h"
 #import <Masonry/Masonry.h>
 
 static NSString * const kCellId = @"MusicLibraryCell";
@@ -33,8 +34,10 @@ static NSString * const kCellId = @"MusicLibraryCell";
 @property (nonatomic, copy) NSArray<NLDownloadItem *> *downloadItems;
 @property (nonatomic, strong) NLCacheManager *cacheManager;
 @property (nonatomic, assign) NSUInteger cachedReloadToken;
+@property (nonatomic, assign) NSUInteger listReloadToken;
 - (NSArray<NLSong *> *)cachedSongsSnapshot;
 - (void)applyCachedSongs:(NSArray<NLSong *> *)songs forToken:(NSUInteger)token;
+- (void)showRepositoryFailure:(NSString *)message;
 @end
 
 @implementation NLMusicLibraryListViewController
@@ -82,13 +85,11 @@ static NSString * const kCellId = @"MusicLibraryCell";
     if (self.mode == NLMusicLibraryListModeCachedSongs) {
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(cacheDidFinish:) name:NLCacheManagerDidFinishCachingNotification object:nil];
     }
-    if (self.mode == NLMusicLibraryListModeDownloadedSongs) {
-        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(downloadDidUpdate:) name:NLDownloadManagerDidUpdateNotification object:nil];
-    }
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
     [super viewWillDisappear:animated];
+    self.listReloadToken += 1;
     if (self.mode == NLMusicLibraryListModeCachedSongs) {
         self.cachedReloadToken += 1;
         [[NSNotificationCenter defaultCenter] removeObserver:self name:NLCacheManagerDidFinishCachingNotification object:nil];
@@ -105,11 +106,37 @@ static NSString * const kCellId = @"MusicLibraryCell";
 
 - (void)downloadDidUpdate:(NSNotification *)note {
     if (self.mode != NLMusicLibraryListModeDownloadedSongs) return;
-    [self loadData];
+    NSDictionary *userInfo = note.userInfo;
+    NSString *songID = [userInfo[@"songId"] isKindOfClass:NSString.class] ? userInfo[@"songId"] : nil;
+    NSString *status = [userInfo[@"status"] isKindOfClass:NSString.class] ? userInfo[@"status"] : nil;
+    if (songID.length == 0 || status.length == 0) {
+        [self loadData];
+        return;
+    }
+    NSUInteger row = [self.downloadItems indexOfObjectPassingTest:^BOOL(NLDownloadItem *item, NSUInteger idx, BOOL *stop) {
+        return [item.songId isEqualToString:songID];
+    }];
+    if (row == NSNotFound) {
+        [self loadData];
+        return;
+    }
+    NLDownloadItem *item = self.downloadItems[row];
+    item.status = status;
+    item.receivedBytes = [userInfo[@"receivedBytes"] longLongValue];
+    item.expectedBytes = [userInfo[@"expectedBytes"] longLongValue];
+    NSIndexPath *indexPath = [NSIndexPath indexPathForRow:(NSInteger)row inSection:0];
+    NLSongListCell *cell = (id)[self.tableView cellForRowAtIndexPath:indexPath];
+    if (cell) {
+        float progress = item.expectedBytes > 0 ? (float)item.receivedBytes / (float)item.expectedBytes : -1.f;
+        [cell configWithDownloadItem:item downloadProgress:progress];
+    }
 }
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
+    if (self.mode == NLMusicLibraryListModeDownloadedSongs) {
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(downloadDidUpdate:) name:NLDownloadManagerDidUpdateNotification object:nil];
+    }
     [self loadData];
 }
 
@@ -123,10 +150,13 @@ static NSString * const kCellId = @"MusicLibraryCell";
     vc.completion = ^(NSString *name) {
         __strong typeof(weakSelf) self = weakSelf;
         if (!self) return;
-        NLPlayList *playList = [NLPlayListRepository createUserPlayListWithName:name];
-        if (playList) {
+        [NLPlayListRepository createUserPlayListWithName:name completion:^(NLPlayList * _Nullable playlist) {
+            if (!playlist) {
+                [self showRepositoryFailure:@"歌单创建失败，请重试。"];
+                return;
+            }
             [self loadData];
-        }
+        }];
     };
     [self presentViewController:vc animated:YES completion:nil];
 }
@@ -143,64 +173,83 @@ static NSString * const kCellId = @"MusicLibraryCell";
     }
 }
 
-- (void)loadData {
-    switch (self.mode) {
-        case NLMusicLibraryListModeRecentPlay: {
-            NSArray<NLSong *> *history = [NLSongRepository allPlayHistory];
-            self.songs = [[[history reverseObjectEnumerator] allObjects] copy];
-            self.playlists = nil;
-            self.albums = nil;
-            self.downloadItems = nil;
-            break;
-        }
-        case NLMusicLibraryListModeLikedSongs: {
-            self.songs = [NLSongRepository allLikedSongs];
-            self.playlists = nil;
-            self.albums = nil;
-            self.downloadItems = nil;
-            break;
-        }
-        case NLMusicLibraryListModeLikedPlaylists: {
-            self.songs = nil;
-            self.playlists = [NLPlayListRepository allLikedPlayLists];
-            self.albums = nil;
-            self.downloadItems = nil;
-            break;
-        }
-        case NLMusicLibraryListModeMyPlaylists: {
-            self.songs = nil;
-            self.playlists = [NLPlayListRepository allUserCreatedPlayLists];
-            self.albums = nil;
-            self.downloadItems = nil;
-            break;
-        }
-        case NLMusicLibraryListModeCachedSongs: {
-            NSUInteger token = ++self.cachedReloadToken;
-            __weak typeof(self) weakSelf = self;
-            [self.cacheManager whenReadyOnQueue:dispatch_get_global_queue(QOS_CLASS_UTILITY, 0) perform:^{
-                __strong typeof(weakSelf) strongSelf = weakSelf;
-                [strongSelf loadCachedSongsForToken:token];
-            }];
-            return;
-        }
-        case NLMusicLibraryListModeDownloadedSongs: {
-            self.songs = nil;
-            self.playlists = nil;
-            self.albums = nil;
-            self.downloadItems = [NLDownloadRepository allDownloadItems];
-            break;
-        }
-        case NLMusicLibraryListModeLikedAlbums: {
-            self.songs = nil;
-            self.playlists = nil;
-            self.albums = [NLAlbumRepository allLikedAlbums];
-            self.downloadItems = nil;
-            break;
-        }
-    }
+- (void)applyListSnapshotForMode:(NLMusicLibraryListMode)mode
+                             token:(NSUInteger)token
+                             songs:(NSArray<NLSong *> *)songs
+                         playlists:(NSArray<NLPlayList *> *)playlists
+                             albums:(NSArray<NLAlbum *> *)albums
+                      downloadItems:(NSArray<NLDownloadItem *> *)downloadItems {
+    if (token != self.listReloadToken || mode != self.mode) return;
+    self.songs = songs;
+    self.playlists = playlists;
+    self.albums = albums;
+    self.downloadItems = downloadItems;
     [self.tableView reloadData];
-    BOOL hasItems = [self rowCount] > 0;
-    self.emptyStateView.hidden = hasItems;
+    self.emptyStateView.hidden = [self rowCount] > 0;
+}
+
+- (void)loadData {
+    NLMusicLibraryListMode mode = self.mode;
+    NSUInteger token = ++self.listReloadToken;
+    if (mode == NLMusicLibraryListModeCachedSongs) {
+        NSUInteger cachedToken = ++self.cachedReloadToken;
+        __weak typeof(self) weakSelf = self;
+        [self.cacheManager whenReadyOnQueue:dispatch_get_global_queue(QOS_CLASS_UTILITY, 0) perform:^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            [strongSelf loadCachedSongsForToken:cachedToken];
+        }];
+        return;
+    }
+
+    if (mode == NLMusicLibraryListModeRecentPlay) {
+        __weak typeof(self) weakSelf = self;
+        [NLSongRepository allPlayHistoryWithCompletion:^(NSArray<NLSong *> *songs) {
+            __strong typeof(weakSelf) self = weakSelf;
+            [self applyListSnapshotForMode:mode token:token songs:songs playlists:nil albums:nil downloadItems:nil];
+        }];
+        return;
+    }
+
+    if (mode == NLMusicLibraryListModeDownloadedSongs) {
+        __weak typeof(self) weakSelf = self;
+        [[NLDownloadManager sharedManager] loadDownloadItemsWithCompletion:^(NSArray<NLDownloadItem *> *items) {
+            __strong typeof(weakSelf) self = weakSelf;
+            [self applyListSnapshotForMode:mode token:token songs:nil playlists:nil albums:nil downloadItems:items];
+        }];
+        return;
+    }
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSArray<NLSong *> *songs = nil;
+        NSArray<NLPlayList *> *playlists = nil;
+        NSArray<NLAlbum *> *albums = nil;
+        NSArray<NLDownloadItem *> *downloadItems = nil;
+        switch (mode) {
+            case NLMusicLibraryListModeRecentPlay:
+                break;
+            case NLMusicLibraryListModeLikedSongs:
+                songs = [NLSongRepository allLikedSongs];
+                break;
+            case NLMusicLibraryListModeLikedPlaylists:
+                playlists = [NLPlayListRepository allLikedPlayLists];
+                break;
+            case NLMusicLibraryListModeMyPlaylists:
+                playlists = [NLPlayListRepository allUserCreatedPlayLists];
+                break;
+            case NLMusicLibraryListModeCachedSongs:
+                break;
+            case NLMusicLibraryListModeDownloadedSongs:
+                downloadItems = [NLDownloadRepository allDownloadItems];
+                break;
+            case NLMusicLibraryListModeLikedAlbums:
+                albums = [NLAlbumRepository allLikedAlbums];
+                break;
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) self = weakSelf;
+            [self applyListSnapshotForMode:mode token:token songs:songs playlists:playlists albums:albums downloadItems:downloadItems];
+        });
+    });
 }
 
 - (void)loadCachedSongsForToken:(NSUInteger)token {
@@ -279,7 +328,8 @@ static NSString * const kCellId = @"MusicLibraryCell";
         [cell configWithNLSong:self.songs[indexPath.row]];
     } else if ([self isDownloadMode]) {
         NLDownloadItem *item = self.downloadItems[indexPath.row];
-        [cell configWithDownloadItem:item downloadProgress:-1.f];
+        float progress = item.expectedBytes > 0 ? (float)item.receivedBytes / (float)item.expectedBytes : -1.f;
+        [cell configWithDownloadItem:item downloadProgress:progress];
     } else if ([self isAlbumMode]) {
         [cell configWithAlbum:self.albums[indexPath.row]];
     } else {
@@ -291,35 +341,38 @@ static NSString * const kCellId = @"MusicLibraryCell";
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     if ([self isDownloadMode]) {
-        NLDownloadItem *selectedItem = self.downloadItems[indexPath.row];
-        if (![selectedItem.status isEqualToString:@"completed"]) return;
-        NSString *selectedSongID = [selectedItem.songId copy];
+        if (indexPath.row >= self.downloadItems.count) return;
+        NSString *selectedSongID = [self.downloadItems[indexPath.row].songId copy];
+        if (!selectedSongID.length) return;
+        NSArray<NLDownloadItem *> *downloadItems = [self.downloadItems copy];
         __weak typeof(self) weakSelf = self;
-        [[NLCacheManager sharedManager] whenReadyOnQueue:dispatch_get_main_queue() perform:^{
-            __strong typeof(weakSelf) strongSelf = weakSelf;
-            if (!strongSelf || !strongSelf.isViewLoaded || strongSelf.mode != NLMusicLibraryListModeDownloadedSongs) return;
-            NLDownloadItem *currentItem = nil;
-            for (NLDownloadItem *item in strongSelf.downloadItems) {
-                if ([item.songId isEqualToString:selectedSongID] && [item.status isEqualToString:@"completed"]) {
-                    currentItem = item;
-                    break;
-                }
-            }
-            if (!currentItem) return;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             NSArray<NLSong *> *allDownloaded = [NLSongRepository allDownloadedSongs];
-            NSMutableDictionary<NSString *, NLSong *> *byId = [NSMutableDictionary dictionary];
-            for (NLSong *song in allDownloaded) { if (song.songId.length) byId[song.songId] = song; }
-            NSMutableArray<NLSong *> *list = [NSMutableArray array];
-            for (NLDownloadItem *item in strongSelf.downloadItems) {
-                if (![item.status isEqualToString:@"completed"]) continue;
-                NLSong *song = byId[item.songId];
-                NSString *cacheKey = [NLCacheManager.sharedManager cacheIdentityForURL:song.playURL cacheKey:song.songId];
-                if (song && [NLCacheManager.sharedManager isFullyCachedForURL:song.playURL cacheKey:cacheKey]) [list addObject:song];
+            NSMutableDictionary<NSString *, NLSong *> *songsByID = [NSMutableDictionary dictionaryWithCapacity:allDownloaded.count];
+            for (NLSong *song in allDownloaded) {
+                if (song.songId.length) songsByID[song.songId] = song;
             }
-            NLSong *song = byId[selectedSongID];
-            NSInteger index = [list indexOfObject:song];
-            if (index != NSNotFound) [[NLPlayerManager sharedManager] playWithPlaylist:[list copy] startIndex:index];
-        }];
+            NSMutableArray<NLSong *> *playlist = [NSMutableArray array];
+            for (NLDownloadItem *item in downloadItems) {
+                NLSong *song = songsByID[item.songId];
+                BOOL isCompleted = [item.status isEqualToString:@"completed"];
+                BOOL hasOfflineFile = isCompleted && [[NLOfflineAudioStore sharedStore] localFileURLForSongID:item.songId] != nil;
+                if (song && hasOfflineFile) [playlist addObject:song];
+            }
+            NLSong *selectedSong = songsByID[selectedSongID];
+            NSUInteger songIndex = [playlist indexOfObject:selectedSong];
+            if (songIndex == NSNotFound) return;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                __strong typeof(weakSelf) self = weakSelf;
+                if (!self || self.mode != NLMusicLibraryListModeDownloadedSongs) return;
+                BOOL stillQueued = [self.downloadItems indexOfObjectPassingTest:^BOOL(NLDownloadItem *item, NSUInteger idx, BOOL *stop) {
+                    return [item.songId isEqualToString:selectedSongID] && [item.status isEqualToString:@"completed"];
+                }] != NSNotFound;
+                if (stillQueued) {
+                    [[NLPlayerManager sharedManager] playWithPlaylist:playlist startIndex:(NSInteger)songIndex];
+                }
+            });
+        });
         return;
     }
     if ([self isSongMode]) {
@@ -335,9 +388,7 @@ static NSString * const kCellId = @"MusicLibraryCell";
         if (!album.albumId.length) return;
         NSInteger albumId = [album.albumId integerValue];
         if (albumId <= 0) return;
-        NLSongListViewController *vc = [[NLSongListViewController alloc] initWithId:albumId
-                                                                               type:NLSongListTypeAlbum
-                                                                               name:album.name ?: @""];
+        NLSongListViewController *vc = [[NLSongListViewController alloc] initWithId:albumId type:NLSongListTypeAlbum name:album.name ?: @""];
         [self.navigationController pushViewController:vc animated:YES];
         return;
     }
@@ -347,9 +398,7 @@ static NSString * const kCellId = @"MusicLibraryCell";
     BOOL isNumeric = ([list.playlistId rangeOfCharacterFromSet:nonDigits].location == NSNotFound);
     NLSongListViewController *vc;
     if (isNumeric && [list.playlistId integerValue] > 0) {
-        vc = [[NLSongListViewController alloc] initWithId:[list.playlistId integerValue]
-                                                    type:NLSongListTypePlaylist
-                                                    name:list.name ?: @""];
+        vc = [[NLSongListViewController alloc] initWithId:[list.playlistId integerValue] type:NLSongListTypePlaylist name:list.name ?: @""];
     } else {
         vc = [[NLSongListViewController alloc] initWithLocalPlayList:list];
     }
@@ -364,58 +413,191 @@ static NSString * const kCellId = @"MusicLibraryCell";
     return YES;
 }
 
+- (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (![self isDownloadMode] || indexPath.row >= self.downloadItems.count) return nil;
+    NLDownloadItem *item = self.downloadItems[indexPath.row];
+    NSString *songID = [item.songId copy];
+    if (songID.length == 0) return nil;
+
+    __weak typeof(self) weakSelf = self;
+    NLDownloadManager *manager = [NLDownloadManager sharedManager];
+    UIContextualAction *(^makeCommandAction)(NSString *, void (^)(void (^)(BOOL))) = ^UIContextualAction *(NSString *title, void (^command)(void (^)(BOOL))) {
+        return [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal title:title handler:^(UIContextualAction *action, UIView *sourceView, void (^completionHandler)(BOOL)) {
+            command(^(BOOL success) {
+                __strong typeof(weakSelf) self = weakSelf;
+                if (self && !success) [self showRepositoryFailure:@"下载操作未能完成，请重试。"];
+                completionHandler(success);
+            });
+        }];
+    };
+
+    NSMutableArray<UIContextualAction *> *actions = [NSMutableArray array];
+    if ([item.status isEqualToString:@"downloading"]) {
+        [actions addObject:makeCommandAction(@"暂停", ^(void (^done)(BOOL)) { [manager pauseDownloadForSongID:songID completion:done]; })];
+        [actions addObject:makeCommandAction(@"取消", ^(void (^done)(BOOL)) { [manager cancelDownloadForSongID:songID completion:done]; })];
+    } else if ([item.status isEqualToString:@"paused"]) {
+        [actions addObject:makeCommandAction(@"继续", ^(void (^done)(BOOL)) { [manager resumeDownloadForSongID:songID completion:done]; })];
+        [actions addObject:makeCommandAction(@"取消", ^(void (^done)(BOOL)) { [manager cancelDownloadForSongID:songID completion:done]; })];
+    } else if ([item.status isEqualToString:@"failed"] || [item.status isEqualToString:@"cancelled"]) {
+        [actions addObject:makeCommandAction(@"重试", ^(void (^done)(BOOL)) { [manager retryDownloadForSongID:songID completion:done]; })];
+    }
+    UIContextualAction *deleteAction = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive title:@"删除" handler:^(UIContextualAction *action, UIView *sourceView, void (^completionHandler)(BOOL)) {
+        [weakSelf tableView:tableView commitEditingStyle:UITableViewCellEditingStyleDelete forRowAtIndexPath:indexPath];
+        completionHandler(YES);
+    }];
+    [actions addObject:deleteAction];
+    UISwipeActionsConfiguration *configuration = [UISwipeActionsConfiguration configurationWithActions:actions];
+    configuration.performsFirstActionWithFullSwipe = NO;
+    return configuration;
+}
+
+- (void)showRepositoryFailure:(NSString *)message {
+    if (self.presentedViewController) return;
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"操作失败"
+                                                                   message:message
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)removeSongRowWithID:(NSString *)songID {
+    NSUInteger row = [self.songs indexOfObjectPassingTest:^BOOL(NLSong *song, NSUInteger idx, BOOL *stop) {
+        return [song.songId isEqualToString:songID];
+    }];
+    if (row == NSNotFound) return;
+    NSMutableArray<NLSong *> *songs = [self.songs mutableCopy];
+    [songs removeObjectAtIndex:row];
+    self.songs = songs;
+    [self.tableView deleteRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:(NSInteger)row inSection:0]] withRowAnimation:UITableViewRowAnimationAutomatic];
+    self.emptyStateView.hidden = [self rowCount] > 0;
+}
+
+- (void)removeDownloadRowWithID:(NSString *)songID {
+    NSUInteger row = [self.downloadItems indexOfObjectPassingTest:^BOOL(NLDownloadItem *item, NSUInteger idx, BOOL *stop) {
+        return [item.songId isEqualToString:songID];
+    }];
+    if (row == NSNotFound) return;
+    NSMutableArray<NLDownloadItem *> *items = [self.downloadItems mutableCopy];
+    [items removeObjectAtIndex:row];
+    self.downloadItems = items;
+    [self.tableView deleteRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:(NSInteger)row inSection:0]] withRowAnimation:UITableViewRowAnimationAutomatic];
+    self.emptyStateView.hidden = [self rowCount] > 0;
+}
+
+- (void)removeAlbumRowWithID:(NSString *)albumID {
+    NSUInteger row = [self.albums indexOfObjectPassingTest:^BOOL(NLAlbum *album, NSUInteger idx, BOOL *stop) {
+        return [album.albumId isEqualToString:albumID];
+    }];
+    if (row == NSNotFound) return;
+    NSMutableArray<NLAlbum *> *albums = [self.albums mutableCopy];
+    [albums removeObjectAtIndex:row];
+    self.albums = albums;
+    [self.tableView deleteRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:(NSInteger)row inSection:0]] withRowAnimation:UITableViewRowAnimationAutomatic];
+    self.emptyStateView.hidden = [self rowCount] > 0;
+}
+
+- (void)removePlaylistRowWithID:(NSString *)playlistID {
+    NSUInteger row = [self.playlists indexOfObjectPassingTest:^BOOL(NLPlayList *playlist, NSUInteger idx, BOOL *stop) {
+        return [playlist.playlistId isEqualToString:playlistID];
+    }];
+    if (row == NSNotFound) return;
+    NSMutableArray<NLPlayList *> *playlists = [self.playlists mutableCopy];
+    [playlists removeObjectAtIndex:row];
+    self.playlists = playlists;
+    [self.tableView deleteRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:(NSInteger)row inSection:0]] withRowAnimation:UITableViewRowAnimationAutomatic];
+    self.emptyStateView.hidden = [self rowCount] > 0;
+}
+
 - (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath {
     if (editingStyle != UITableViewCellEditingStyleDelete) return;
     if ([self isSongMode]) {
+        if (indexPath.row >= self.songs.count) return;
         NLSong *song = self.songs[indexPath.row];
-        if (self.mode == NLMusicLibraryListModeRecentPlay) {
-            [NLSongRepository removePlayHistoryWithSongId:song.songId];
-        } else if (self.mode == NLMusicLibraryListModeLikedSongs) {
-            [NLSongRepository likeSong:song isLike:NO];
+        NSString *songID = [song.songId copy];
+        if (!songID.length) return;
+        if (self.mode == NLMusicLibraryListModeCachedSongs) {
+            [self removeSongRowWithID:songID];
+            return;
         }
-        // NLMusicLibraryListModeCachedSongs：仅从列表移除，不删历史/收藏
-        NSMutableArray *mutable = [self.songs mutableCopy];
-        [mutable removeObjectAtIndex:indexPath.row];
-        self.songs = [mutable copy];
-    } else if ([self isDownloadMode]) {
         __weak typeof(self) weakSelf = self;
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"删除已下载"
-                                                                       message:@"确定删除该首已下载的音乐吗？"
+        void (^finishRemoval)(BOOL) = ^(BOOL success) {
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self) return;
+            if (success) {
+                [self removeSongRowWithID:songID];
+            } else {
+                [self showRepositoryFailure:@"歌曲状态未能保存，列表未更改。"];
+            }
+        };
+        if (self.mode == NLMusicLibraryListModeRecentPlay) {
+            [NLSongRepository removePlayHistoryWithSongId:songID completion:finishRemoval];
+        } else if (self.mode == NLMusicLibraryListModeLikedSongs) {
+            [NLSongRepository likeSong:song isLike:NO completion:finishRemoval];
+        }
+        return;
+    }
+    if ([self isDownloadMode]) {
+        if (indexPath.row >= self.downloadItems.count) return;
+        NSString *songID = [self.downloadItems[indexPath.row].songId copy];
+        if (!songID.length) return;
+        __weak typeof(self) weakSelf = self;
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"删除下载"
+                                                                       message:@"确定删除该首下载的音乐吗？"
                                                                 preferredStyle:UIAlertControllerStyleAlert];
         [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
         [alert addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
-            __strong typeof(weakSelf) strongSelf = weakSelf;
-            if (!strongSelf || indexPath.row >= (NSInteger)strongSelf.downloadItems.count) return;
-            NLDownloadItem *item = strongSelf.downloadItems[indexPath.row];
-            [NLDownloadRepository removeDownloadItemWithSongId:item.songId];
-            [NLSongRepository removeDownloadedSong:item.songId];
-            NSMutableArray *mutable = [strongSelf.downloadItems mutableCopy];
-            [mutable removeObjectAtIndex:indexPath.row];
-            strongSelf.downloadItems = [mutable copy];
-            [tableView deleteRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationAutomatic];
-            strongSelf.emptyStateView.hidden = [strongSelf rowCount] > 0;
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self) return;
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                [[NLDownloadManager sharedManager] removeOfflineDownloadForSongID:songID];
+                [NLDownloadRepository removeDownloadItemWithSongId:songID completion:^(BOOL queueRemoved) {
+                    if (!queueRemoved) {
+                        [self showRepositoryFailure:@"下载记录未能删除，列表未更改。"];
+                        return;
+                    }
+                    [NLSongRepository removeDownloadedSong:songID completion:^(BOOL songRemoved) {
+                        if (!songRemoved) {
+                            [self showRepositoryFailure:@"歌曲记录未能删除，列表未更改。"];
+                            return;
+                        }
+                        [self removeDownloadRowWithID:songID];
+                    }];
+                }];
+            });
         }]];
         [self presentViewController:alert animated:YES completion:nil];
         return;
-    } else if ([self isAlbumMode]) {
-        NLAlbum *album = self.albums[indexPath.row];
-        [NLAlbumRepository setAlbum:album liked:NO];
-        NSMutableArray *mutable = [self.albums mutableCopy];
-        [mutable removeObjectAtIndex:indexPath.row];
-        self.albums = [mutable copy];
-    } else {
-        NLPlayList *list = self.playlists[indexPath.row];
-        if (self.mode == NLMusicLibraryListModeLikedPlaylists) {
-            [NLPlayListRepository setPlayList:list liked:NO];
-        } else {
-            [NLPlayListRepository deletePlayList:list.playlistId];
-        }
-        NSMutableArray *mutable = [self.playlists mutableCopy];
-        [mutable removeObjectAtIndex:indexPath.row];
-        self.playlists = [mutable copy];
     }
-    [tableView deleteRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationAutomatic];
-    self.emptyStateView.hidden = [self rowCount] > 0;
+    if ([self isAlbumMode]) {
+        if (indexPath.row >= self.albums.count) return;
+        NLAlbum *album = self.albums[indexPath.row];
+        NSString *albumID = [album.albumId copy];
+        if (!albumID.length) return;
+        __weak typeof(self) weakSelf = self;
+        [NLAlbumRepository setAlbum:album liked:NO completion:^(BOOL success) {
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self) return;
+            if (success) [self removeAlbumRowWithID:albumID];
+            else [self showRepositoryFailure:@"专辑收藏状态未能保存，列表未更改。"];
+        }];
+        return;
+    }
+    if (indexPath.row >= self.playlists.count) return;
+    NLPlayList *playlist = self.playlists[indexPath.row];
+    NSString *playlistID = [playlist.playlistId copy];
+    if (!playlistID.length) return;
+    __weak typeof(self) weakSelf = self;
+    void (^finishRemoval)(BOOL) = ^(BOOL success) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self) return;
+        if (success) [self removePlaylistRowWithID:playlistID];
+        else [self showRepositoryFailure:@"歌单状态未能保存，列表未更改。"];
+    };
+    if (self.mode == NLMusicLibraryListModeLikedPlaylists) {
+        [NLPlayListRepository setPlayList:playlist liked:NO completion:finishRemoval];
+    } else {
+        [NLPlayListRepository deletePlayList:playlistID completion:finishRemoval];
+    }
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForDeleteConfirmationButtonForRowAtIndexPath:(NSIndexPath *)indexPath {

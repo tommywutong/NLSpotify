@@ -25,7 +25,7 @@
 
     NSString *path = @"/artist/album?id=3684&limit=5";
     [[NetWorkManager sharedManager] GET:path
-                             parameters:nil
+                             parameters:@{}
                                 success:^(id  _Nullable responseObject) {
 
       //NLSingerAlbumListModel *model = [[NLSingerAlbumListModel alloc] init];

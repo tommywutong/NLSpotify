@@ -11,11 +11,6 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface NLMusicPlayerAccessoryViewController : UIViewController
 
-- (void)playSongWithId:(NSString *)songId
-                 title:(NSString *)title
-                artist:(NSString *)artist
-              coverURL:(NSURL * _Nullable)coverURL;
-
 @end
 
 NS_ASSUME_NONNULL_END
