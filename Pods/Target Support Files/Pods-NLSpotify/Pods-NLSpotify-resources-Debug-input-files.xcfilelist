@@ -1,5 +1,4 @@
 ${PODS_ROOT}/Target Support Files/Pods-NLSpotify/Pods-NLSpotify-resources.sh
-${PODS_CONFIGURATION_BUILD_DIR}/FMDB/FMDB_Privacy.bundle
 ${PODS_ROOT}/HysteriaPlayer/HysteriaPlayer/point1sec.mp3
 ${PODS_CONFIGURATION_BUILD_DIR}/IQKeyboardManager/IQKeyboardManager.bundle
 ${PODS_CONFIGURATION_BUILD_DIR}/JXCategoryView/JXCategoryView.bundle

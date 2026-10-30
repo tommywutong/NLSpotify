@@ -97,14 +97,12 @@ EOM
   esac
 }
 if [[ "$CONFIGURATION" == "Debug" ]]; then
-  install_resource "${PODS_CONFIGURATION_BUILD_DIR}/FMDB/FMDB_Privacy.bundle"
   install_resource "${PODS_ROOT}/HysteriaPlayer/HysteriaPlayer/point1sec.mp3"
   install_resource "${PODS_CONFIGURATION_BUILD_DIR}/IQKeyboardManager/IQKeyboardManager.bundle"
   install_resource "${PODS_CONFIGURATION_BUILD_DIR}/JXCategoryView/JXCategoryView.bundle"
   install_resource "${PODS_CONFIGURATION_BUILD_DIR}/SDWebImage/SDWebImage.bundle"
 fi
 if [[ "$CONFIGURATION" == "Release" ]]; then
-  install_resource "${PODS_CONFIGURATION_BUILD_DIR}/FMDB/FMDB_Privacy.bundle"
   install_resource "${PODS_ROOT}/HysteriaPlayer/HysteriaPlayer/point1sec.mp3"
   install_resource "${PODS_CONFIGURATION_BUILD_DIR}/IQKeyboardManager/IQKeyboardManager.bundle"
   install_resource "${PODS_CONFIGURATION_BUILD_DIR}/JXCategoryView/JXCategoryView.bundle"

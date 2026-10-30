@@ -26,7 +26,7 @@ PODS:
     - SDWebImage/Core (= 5.21.6)
   - SDWebImage/Core (5.21.6)
   - SocketRocket (0.7.1)
-  - WCDB.objc (2.1.15):
+  - WCDB.objc (2.1.16):
     - WCDBOptimizedSQLCipher (= 1.4.8)
   - WCDBOptimizedSQLCipher (1.4.8)
   - YYModel (1.0.4)
@@ -41,7 +41,7 @@ DEPENDENCIES:
   - ReactiveObjC
   - SDWebImage
   - SocketRocket
-  - WCDB.objc
+  - WCDB.objc (~> 2.1.16)
   - YYModel
 
 SPEC REPOS:
@@ -69,10 +69,10 @@ SPEC CHECKSUMS:
   ReactiveObjC: 011caa393aa0383245f2dcf9bf02e86b80b36040
   SDWebImage: 1bb6a1b84b6fe87b972a102bdc77dd589df33477
   SocketRocket: d4aabe649be1e368d1318fdf28a022d714d65748
-  WCDB.objc: 35650ab6d455a4a865d94d95436b1ddc865479af
+  WCDB.objc: d88dd9184fc7797b10890efadd593b8ce1d062dc
   WCDBOptimizedSQLCipher: 871994f7f620302fdf87a2729c099a1efa2223da
   YYModel: 2a7fdd96aaa4b86a824e26d0c517de8928c04b30
 
-PODFILE CHECKSUM: 7e41b29aae371dda6c33ec6575df0e85159525e5
+PODFILE CHECKSUM: 2b6e88b263c62950d3517c120cd42088dab4dabb
 
 COCOAPODS: 1.16.2

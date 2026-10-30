@@ -7,7 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		1A6A8824221F85FA07136FE7 /* Pods_NLSpotify.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1DDCF1B8B8455F62FC3CEA4E /* Pods_NLSpotify.framework */; };
+		6545C0149130DF723F7AF0C0 /* Pods_NLSpotify.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 434A100F6986FD9DE63F3A33 /* Pods_NLSpotify.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -28,7 +28,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
-		1DDCF1B8B8455F62FC3CEA4E /* Pods_NLSpotify.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_NLSpotify.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+		434A100F6986FD9DE63F3A33 /* Pods_NLSpotify.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_NLSpotify.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		4C7D81DB2EE3EF46003C5014 /* NLSpotify.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = NLSpotify.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		4C7D81F62EE3EF47003C5014 /* NLSpotifyTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = NLSpotifyTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		4C7D82002EE3EF47003C5014 /* NLSpotifyUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = NLSpotifyUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -72,7 +72,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				1A6A8824221F85FA07136FE7 /* Pods_NLSpotify.framework in Frameworks */,
+				6545C0149130DF723F7AF0C0 /* Pods_NLSpotify.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -118,7 +118,7 @@
 		AA692EF447C63672F15A14B2 /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
-				1DDCF1B8B8455F62FC3CEA4E /* Pods_NLSpotify.framework */,
+				434A100F6986FD9DE63F3A33 /* Pods_NLSpotify.framework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -143,7 +143,7 @@
 				4C7D81D72EE3EF46003C5014 /* Sources */,
 				4C7D81D82EE3EF46003C5014 /* Frameworks */,
 				4C7D81D92EE3EF46003C5014 /* Resources */,
-				155D53BD52250A410EBF513E /* [CP] Embed Pods Frameworks */,
+				2B2D31E052263AA8C4B9710D /* [CP] Copy Pods Resources */,
 			);
 			buildRules = (
 			);
@@ -267,27 +267,6 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXShellScriptBuildPhase section */
-		155D53BD52250A410EBF513E /* [CP] Embed Pods Frameworks */ = {
-			isa = PBXShellScriptBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputFileListPaths = (
-				"${PODS_ROOT}/Target Support Files/Pods-NLSpotify/Pods-NLSpotify-frameworks-${CONFIGURATION}-input-files.xcfilelist",
-			);
-			inputPaths = (
-			);
-			name = "[CP] Embed Pods Frameworks";
-			outputFileListPaths = (
-				"${PODS_ROOT}/Target Support Files/Pods-NLSpotify/Pods-NLSpotify-frameworks-${CONFIGURATION}-output-files.xcfilelist",
-			);
-			outputPaths = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/sh;
-			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-NLSpotify/Pods-NLSpotify-frameworks.sh\"\n";
-			showEnvVarsInLog = 0;
-		};
 		25FCAA0C3D759083A9A3854A /* [CP] Check Pods Manifest.lock */ = {
 			isa = PBXShellScriptBuildPhase;
 			buildActionMask = 2147483647;
@@ -308,6 +287,27 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
 			shellScript = "diff \"${PODS_PODFILE_DIR_PATH}/Podfile.lock\" \"${PODS_ROOT}/Manifest.lock\" > /dev/null\nif [ $? != 0 ] ; then\n    # print error to STDERR\n    echo \"error: The sandbox is not in sync with the Podfile.lock. Run 'pod install' or update your CocoaPods installation.\" >&2\n    exit 1\nfi\n# This output is used by Xcode 'outputs' to avoid re-running this script phase.\necho \"SUCCESS\" > \"${SCRIPT_OUTPUT_FILE_0}\"\n";
+			showEnvVarsInLog = 0;
+		};
+		2B2D31E052263AA8C4B9710D /* [CP] Copy Pods Resources */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-NLSpotify/Pods-NLSpotify-resources-${CONFIGURATION}-input-files.xcfilelist",
+			);
+			inputPaths = (
+			);
+			name = "[CP] Copy Pods Resources";
+			outputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-NLSpotify/Pods-NLSpotify-resources-${CONFIGURATION}-output-files.xcfilelist",
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-NLSpotify/Pods-NLSpotify-resources.sh\"\n";
 			showEnvVarsInLog = 0;
 		};
 /* End PBXShellScriptBuildPhase section */
